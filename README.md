@@ -9,7 +9,26 @@ git clone --recursive https://github.com/sjtu-zhao-lab/FreeKV.git
 cd FreeKV
 ```
 
-### 2. Patch third-party dependencies
+### 2. Create the environment with uv
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) if you haven't already:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Create a virtual environment and install all dependencies:
+```bash
+uv venv --python 3.10
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
+
+> **Note:** `flash-attn` requires building from source. Install it separately after the base dependencies:
+> ```bash
+> uv pip install flash-attn==2.6.3 --no-build-isolation
+> ```
+
+### 3. Patch third-party dependencies
 
 After cloning, apply the following patches to the submodules:
 
@@ -79,10 +98,10 @@ sed -i '/^struct IOType<__nv_bfloat162, 4>/,+3s/^};$/};\n/' \
   3rdparty/raft/cpp/include/raft/util/vectorized.cuh
 ```
 
-### 3. Build
+### 4. Build
 ```bash
 cd source
-pip install -e .
+uv pip install -e .
 ```
 
 ## Usage

@@ -1,0 +1,11 @@
+{
+	"test": "{question} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"AIME": "{problem} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"AIME24": "{problem} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"GPQAd": "{Question} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"GPQAm": "{Question} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"GPQA50": "{Question} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"GPQA50c": "{question} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"MATH500": "{problem} Please reason step by step, and put your final answer within \\boxed{{}}.\n",
+	"MATH50": "{problem} Please reason step by step, and put your final answer within \\boxed{{}}.\n"
+}
