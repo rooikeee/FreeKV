@@ -5,6 +5,10 @@ This directory contains evaluation pipelines for **LongBench2**, **LongGenBench*
 ```bash
 cd accuracy
 ```
+For razor attention patterns:
+```bash
+tar -xzvf razor_patterns.tar.gz
+```
 
 ## Methods
 
