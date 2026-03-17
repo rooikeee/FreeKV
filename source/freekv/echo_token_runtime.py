@@ -79,6 +79,8 @@ class EchoTokenPrefetchRuntime:
         self.page_sink_ready = [False, False]
         self.page_ids = None  # [bsz, local_pages], int32
         self.page_ids_bsz = 0
+        self.win_pack_k = None  # [eff, win_tokens, n_kv_heads, head_dim]
+        self.win_pack_v = None
 
         self.gpu_mid = [None, None]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         self.pending_idx = 0
@@ -177,6 +179,16 @@ class EchoTokenPrefetchRuntime:
             self.page_kv_buf[1] = torch.empty_like(self.page_kv_buf[0])
         else:
             self.page_kv_buf = [None, None]
+        if self.win_tokens > 0:
+            self.win_pack_k = torch.empty(
+                (eff_bsz, self.win_tokens, self.n_kv_heads, self.head_dim),
+                dtype=dtype,
+                device=device,
+            )
+            self.win_pack_v = torch.empty_like(self.win_pack_k)
+        else:
+            self.win_pack_k = None
+            self.win_pack_v = None
         self.reset_state()
 
     def reset_state(self):
@@ -387,12 +399,10 @@ class EchoTokenPrefetchRuntime:
         off = self.n_sink_pages + self.mid_pages
         if self.win_ptr == 0:
             win_tok = self.win_k[: self.eff_batch].transpose(1, 2)
+            win_tok_v = self.win_v[: self.eff_batch].transpose(1, 2)
         else:
-            win_tok = torch.empty(
-                (self.eff_batch, self.win_tokens, self.n_kv_heads, self.head_dim),
-                dtype=self.win_k.dtype,
-                device=self.win_k.device,
-            )
+            win_tok = self.win_pack_k
+            win_tok_v = self.win_pack_v
             tail = self.win_tokens - self.win_ptr
             win_tok[:, :tail].copy_(
                 self.win_k[: self.eff_batch, :, self.win_ptr :].transpose(1, 2),
@@ -402,15 +412,6 @@ class EchoTokenPrefetchRuntime:
                 self.win_k[: self.eff_batch, :, : self.win_ptr].transpose(1, 2),
                 non_blocking=True,
             )
-        win_pages = win_tok.reshape(
-            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
-        )
-        dst_pages[:, off : off + self.n_win_pages, 0].copy_(win_pages, non_blocking=True)
-        if self.win_ptr == 0:
-            win_tok_v = self.win_v[: self.eff_batch].transpose(1, 2)
-        else:
-            win_tok_v = torch.empty_like(win_tok)
-            tail = self.win_tokens - self.win_ptr
             win_tok_v[:, :tail].copy_(
                 self.win_v[: self.eff_batch, :, self.win_ptr :].transpose(1, 2),
                 non_blocking=True,
@@ -419,6 +420,10 @@ class EchoTokenPrefetchRuntime:
                 self.win_v[: self.eff_batch, :, : self.win_ptr].transpose(1, 2),
                 non_blocking=True,
             )
+        win_pages = win_tok.reshape(
+            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        dst_pages[:, off : off + self.n_win_pages, 0].copy_(win_pages, non_blocking=True)
         win_pages_v = win_tok_v.reshape(
             self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
         )
@@ -724,6 +729,31 @@ class EchoTokenPrefetchRuntime:
         )
         local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         anchors = starts + local_best
+        anchors, _ = torch.sort(anchors, dim=-1)
+        self.anchors = anchors
+
+    def update_anchors_from_active_mid(self, q: torch.Tensor):
+        # Use active gpu_mid directly to avoid extra permute/contiguous on flashinfer path.
+        if self.mid_pages <= 0:
+            return
+        if self.active_starts is None:
+            return
+        eff_q = q[: self.eff_batch]
+        mid = self.gpu_mid[self.active_idx][: self.eff_batch, :, 0]  # [eff, mid_tokens, n_kv_heads, head_dim]
+        grouped_q = eff_q.view(
+            self.eff_batch, self.n_kv_heads, self.n_q_per_kv, self.head_dim
+        ).mean(dim=2)  # [eff, n_kv_heads, head_dim]
+        head_idx = self._get_head_index(grouped_q.device)
+        if head_idx is not None:
+            grouped_q = grouped_q.index_select(1, head_idx)
+            mid = mid.index_select(2, head_idx)
+        # [eff, sampled_heads, mid_tokens]
+        scores = torch.einsum("ehd,ethd->eht", grouped_q, mid) * self._inv_sqrt_head_dim
+        page_probs = scores.view(
+            self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
+        )
+        local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
+        anchors = self.active_starts + local_best
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors
 

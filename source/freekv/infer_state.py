@@ -729,7 +729,6 @@ class InferState:
             else:
                 out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
-            k_mid, _ = rt.current_middle_kv(q.shape[0])
         else:
             pack_t0 = self._perf_start("pack")
             local_k, local_v, k_mid = rt.local_kv(q.shape[0])
@@ -739,7 +738,10 @@ class InferState:
             self._perf_stop("attn", attn_t0)
 
         sel_t0 = self._perf_start("select")
-        rt.update_anchors_from_middle(q, k_mid)
+        if self.echo_attn_backend == "flashinfer":
+            rt.update_anchors_from_active_mid(q)
+        else:
+            rt.update_anchors_from_middle(q, k_mid)
         self._perf_stop("select", sel_t0)
 
         next_starts = rt.build_starts(cur_seq + 1)
