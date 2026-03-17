@@ -154,6 +154,7 @@ class InferState:
             b: kernels.BatchDecodeWithPagedKVCacheWrapper(w, self.layout)
             for b, w in zip(self.budget2layers, wbufs)
         }
+        self.echo_decode_handler_tab: Dict[int, kernels.BatchDecodeWithPagedKVCacheWrapper] = {}
 
         self.default_stream = torch.cuda.default_stream(self.device)
         self.prefill_backup_stream = torch.cuda.Stream(self.device)
@@ -283,6 +284,19 @@ class InferState:
                     use_cuda_token_recall=self.echo_use_cuda_token_recall,
                     anchor_head_sample=self.echo_anchor_head_sample,
                 )
+            if self.echo_attn_backend == "flashinfer":
+                local_pages_set = sorted(
+                    {
+                        rt.local_pages
+                        for rt in self.echo_runtimes
+                        if rt is not None and rt.local_pages > 0
+                    }
+                )
+                for lp in local_pages_set:
+                    w = torch.empty(64 * 1024 * 1024, **self._u8)
+                    self.echo_decode_handler_tab[lp] = (
+                        kernels.BatchDecodeWithPagedKVCacheWrapper(w, self.layout)
+                    )
     
     def _shutdown_cpp_pool(self):
         try:
@@ -554,10 +568,26 @@ class InferState:
                 self.page_size,
                 data_type=self.dtype,
             )
+        if self.echo_token and self.echo_attn_backend == "flashinfer":
+            for lp, h in self.echo_decode_handler_tab.items():
+                echo_indptr = torch.arange(0, bsz * lp + 1, lp, **self._i32)
+                echo_last_page_lens = torch.full((bsz,), self.page_size, **self._i32)
+                h.begin_forward(
+                    echo_indptr,
+                    echo_last_page_lens,
+                    self.n_qo_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.page_size,
+                    data_type=self.dtype,
+                )
 
     def _finish_decode(self, bsz):
         for handler in self.decode_handler_tab.values():
             handler.end_forward()
+        if self.echo_token and self.echo_attn_backend == "flashinfer":
+            for handler in self.echo_decode_handler_tab.values():
+                handler.end_forward()
 
     def begin_forward(self, bsz, q_len):
         if q_len > 1:
@@ -693,7 +723,11 @@ class InferState:
             page_kv, page_ids = rt.paged_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)
             attn_t0 = self._perf_start("attn")
-            out = self.decode_handler_tab[kvc.budget].forward(q, page_kv, page_ids)
+            handler = self.echo_decode_handler_tab.get(rt.local_pages, None)
+            if handler is None:
+                out = self.decode_handler_tab[kvc.budget].forward(q, page_kv, page_ids)
+            else:
+                out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
             k_mid, _ = rt.current_middle_kv(q.shape[0])
         else:
