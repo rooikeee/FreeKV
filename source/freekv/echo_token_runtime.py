@@ -49,6 +49,7 @@ class EchoTokenPrefetchRuntime:
         self.dtype: Optional[torch.dtype] = None
         self.recall_stream: Optional[torch.cuda.Stream] = None
         self.prefetch_event = None
+        self.append_event = None
 
         self.batch_size = 0
         self.eff_batch = 0
@@ -60,6 +61,14 @@ class EchoTokenPrefetchRuntime:
         self.sink_v = None
         self.win_k = None   # [bsz, win_tokens, n_kv_heads, head_dim]
         self.win_v = None
+        self.sink_len = 0
+        self.win_len = 0
+        self.win_ptr = 0
+
+        self.local_k_buf = [None, None]
+        self.local_v_buf = [None, None]
+        self.local_mid_ready = [False, False]
+        self.local_total_cap = self.sink_tokens + self.mid_tokens + self.win_tokens
 
         self.gpu_mid = [None, None]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         self.pending_idx = 0
@@ -86,6 +95,9 @@ class EchoTokenPrefetchRuntime:
             if self.recall_stream is None:
                 self.recall_stream = torch.cuda.Stream(device)
                 self.prefetch_event = torch.cuda.Event()
+                self.append_event = torch.cuda.Event()
+            elif self.append_event is None:
+                self.append_event = torch.cuda.Event()
             return
 
         eff_bsz = self._effective_batch(bsz)
@@ -108,6 +120,9 @@ class EchoTokenPrefetchRuntime:
         if self.recall_stream is None:
             self.recall_stream = torch.cuda.Stream(device)
             self.prefetch_event = torch.cuda.Event()
+            self.append_event = torch.cuda.Event()
+        elif self.append_event is None:
+            self.append_event = torch.cuda.Event()
 
         min_cap = self.sink_tokens + self.win_tokens + self.mid_tokens + 16
         self.cpu_capacity = max(2048, min_cap)
@@ -123,6 +138,18 @@ class EchoTokenPrefetchRuntime:
             device=device,
         )
         self.gpu_mid[1] = torch.empty_like(self.gpu_mid[0])
+        if self.local_total_cap > 0:
+            self.local_k_buf[0] = torch.empty(
+                (eff_bsz, self.local_total_cap, self.n_kv_heads, self.head_dim),
+                dtype=dtype,
+                device=device,
+            )
+            self.local_v_buf[0] = torch.empty_like(self.local_k_buf[0])
+            self.local_k_buf[1] = torch.empty_like(self.local_k_buf[0])
+            self.local_v_buf[1] = torch.empty_like(self.local_v_buf[0])
+        else:
+            self.local_k_buf = [None, None]
+            self.local_v_buf = [None, None]
         self.reset_state()
 
     def reset_state(self):
@@ -131,6 +158,9 @@ class EchoTokenPrefetchRuntime:
         self.sink_v = None
         self.win_k = None
         self.win_v = None
+        self.sink_len = 0
+        self.win_len = 0
+        self.win_ptr = 0
         self.anchors = None
         self.pending_idx = 0
         self.active_idx = 0
@@ -139,10 +169,13 @@ class EchoTokenPrefetchRuntime:
         self.pending_starts = None
         self.active_starts = None
         self.prefetch_ready = False
+        self.local_mid_ready = [False, False]
 
     def _maybe_expand_cpu(self, needed_tokens: int):
         if needed_tokens <= self.cpu_capacity:
             return
+        if self.recall_stream is not None:
+            self.recall_stream.synchronize()
         old_cap = self.cpu_capacity
         new_cap = old_cap
         while new_cap < needed_tokens:
@@ -162,43 +195,79 @@ class EchoTokenPrefetchRuntime:
         # k/v: [bsz, q_len, n_kv_heads, head_dim]
         q_len = k.shape[1]
         self._maybe_expand_cpu(q_len)
-        self.cpu_kv[:, :q_len, 0].copy_(k, non_blocking=False)
-        self.cpu_kv[:, :q_len, 1].copy_(v, non_blocking=False)
+        self.cpu_kv[:, :q_len, 0].copy_(k, non_blocking=True)
+        self.cpu_kv[:, :q_len, 1].copy_(v, non_blocking=True)
         self.cpu_len = q_len
 
-        sink_len = min(self.sink_tokens, q_len)
-        win_len = min(self.win_tokens, q_len)
-        self.sink_k = k[:, :sink_len].contiguous()
-        self.sink_v = v[:, :sink_len].contiguous()
-        self.win_k = k[:, -win_len:].contiguous()
-        self.win_v = v[:, -win_len:].contiguous()
+        self.sink_len = min(self.sink_tokens, q_len)
+        self.win_len = min(self.win_tokens, q_len)
+        self.win_ptr = 0
 
-    def append_decode_token_to_cpu(self, k_tok: torch.Tensor, v_tok: torch.Tensor):
+        if self.sink_tokens > 0:
+            self.sink_k = torch.empty(
+                (self.batch_size, self.sink_tokens, self.n_kv_heads, self.head_dim),
+                dtype=k.dtype,
+                device=k.device,
+            )
+            self.sink_v = torch.empty_like(self.sink_k)
+            if self.sink_len > 0:
+                self.sink_k[:, : self.sink_len].copy_(k[:, : self.sink_len], non_blocking=True)
+                self.sink_v[:, : self.sink_len].copy_(v[:, : self.sink_len], non_blocking=True)
+        else:
+            self.sink_k = None
+            self.sink_v = None
+
+        if self.win_tokens > 0:
+            self.win_k = torch.empty(
+                (self.batch_size, self.win_tokens, self.n_kv_heads, self.head_dim),
+                dtype=k.dtype,
+                device=k.device,
+            )
+            self.win_v = torch.empty_like(self.win_k)
+            if self.win_len > 0:
+                self.win_k[:, : self.win_len].copy_(
+                    k[:, q_len - self.win_len : q_len], non_blocking=True
+                )
+                self.win_v[:, : self.win_len].copy_(
+                    v[:, q_len - self.win_len : q_len], non_blocking=True
+                )
+        else:
+            self.win_k = None
+            self.win_v = None
+
+    def append_decode_token_to_cpu(
+        self,
+        k_tok: torch.Tensor,
+        v_tok: torch.Tensor,
+        src_stream: Optional[torch.cuda.Stream] = None,
+    ):
         # k_tok/v_tok: [bsz, 1, n_kv_heads, head_dim]
         needed = self.cpu_len + 1
         self._maybe_expand_cpu(needed)
-        self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 0].copy_(k_tok, non_blocking=False)
-        self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 1].copy_(v_tok, non_blocking=False)
+        if src_stream is None:
+            src_stream = torch.cuda.current_stream(self.device)
+        self.append_event.record(src_stream)
+        with torch.cuda.stream(self.recall_stream):
+            self.recall_stream.wait_event(self.append_event)
+            self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 0].copy_(k_tok, non_blocking=True)
+            self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 1].copy_(v_tok, non_blocking=True)
         self.cpu_len = needed
 
         if self.sink_tokens > 0:
-            if self.sink_k is None:
-                self.sink_k = k_tok.contiguous()
-                self.sink_v = v_tok.contiguous()
-            elif self.sink_k.shape[1] < self.sink_tokens:
-                self.sink_k = torch.cat([self.sink_k, k_tok], dim=1)
-                self.sink_v = torch.cat([self.sink_v, v_tok], dim=1)
+            if self.sink_len < self.sink_tokens:
+                self.sink_k[:, self.sink_len : self.sink_len + 1].copy_(k_tok, non_blocking=True)
+                self.sink_v[:, self.sink_len : self.sink_len + 1].copy_(v_tok, non_blocking=True)
+                self.sink_len += 1
 
         if self.win_tokens > 0:
-            if self.win_k is None:
-                self.win_k = k_tok.contiguous()
-                self.win_v = v_tok.contiguous()
-            elif self.win_k.shape[1] < self.win_tokens:
-                self.win_k = torch.cat([self.win_k, k_tok], dim=1)
-                self.win_v = torch.cat([self.win_v, v_tok], dim=1)
+            if self.win_len < self.win_tokens:
+                self.win_k[:, self.win_len : self.win_len + 1].copy_(k_tok, non_blocking=True)
+                self.win_v[:, self.win_len : self.win_len + 1].copy_(v_tok, non_blocking=True)
+                self.win_len += 1
             else:
-                self.win_k = torch.cat([self.win_k[:, 1:], k_tok], dim=1)
-                self.win_v = torch.cat([self.win_v[:, 1:], v_tok], dim=1)
+                self.win_k[:, self.win_ptr : self.win_ptr + 1].copy_(k_tok, non_blocking=True)
+                self.win_v[:, self.win_ptr : self.win_ptr + 1].copy_(v_tok, non_blocking=True)
+                self.win_ptr = (self.win_ptr + 1) % self.win_tokens
 
     def middle_bounds(self, seq_len: int) -> Optional[Tuple[int, int]]:
         lower = self.sink_tokens
@@ -247,11 +316,10 @@ class EchoTokenPrefetchRuntime:
         ).mean(dim=3).transpose(1, 2)  # [eff, n_kv_heads, 1, head_dim]
         k_t = eff_k.transpose(1, 2).contiguous()  # [eff, n_kv_heads, seq_len, head_dim]
         scores = torch.matmul(grouped_q, k_t.transpose(2, 3)) / math.sqrt(self.head_dim)
-        probs = torch.softmax(scores, dim=-1)[:, :, 0, :]  # [eff, n_kv_heads, seq_len]
-        mid_probs = probs[..., lower:upper]
-        k = min(self.seed_anchors, mid_probs.shape[-1])
-        seed = torch.topk(mid_probs, k=k, dim=-1).indices + lower
-        seed = seed.mean(dim=1).round().to(torch.long)  # [eff, k], shared over kv heads
+        mid_scores = scores[:, :, 0, lower:upper]  # [eff, n_kv_heads, mid_len]
+        k = min(self.seed_anchors, mid_scores.shape[-1])
+        seed = torch.topk(mid_scores, k=k, dim=-1).indices + lower
+        seed = seed.to(mid_scores.dtype).mean(dim=1).round().to(torch.long)  # [eff, k], shared over kv heads
         seed, _ = torch.sort(seed, dim=-1)
         anchors = self._expand_seed_anchors(seed)
         anchors, _ = torch.sort(anchors, dim=-1)
@@ -308,8 +376,10 @@ class EchoTokenPrefetchRuntime:
             self.prefetch_ready = False
             return
         self.pending_idx = 1 - self.active_idx
+        self.local_mid_ready[self.pending_idx] = False
         out_buf = self.gpu_mid[self.pending_idx]
         starts_i32 = starts.to(device=self.device, dtype=torch.int32).contiguous()
+        sink_len = self.sink_len
 
         with torch.cuda.stream(self.recall_stream):
             used_cuda = False
@@ -326,6 +396,17 @@ class EchoTokenPrefetchRuntime:
                     used_cuda = False
             if not used_cuda:
                 self._fallback_recall(starts, out_buf)
+            if self.local_k_buf[self.pending_idx] is not None:
+                local_k = self.local_k_buf[self.pending_idx]
+                local_v = self.local_v_buf[self.pending_idx]
+                mid_k = out_buf[:, :, 0]
+                mid_v = out_buf[:, :, 1]
+                if sink_len > 0:
+                    local_k[:, :sink_len].copy_(self.sink_k[: self.eff_batch, :sink_len], non_blocking=True)
+                    local_v[:, :sink_len].copy_(self.sink_v[: self.eff_batch, :sink_len], non_blocking=True)
+                local_k[:, sink_len : sink_len + self.mid_tokens].copy_(mid_k, non_blocking=True)
+                local_v[:, sink_len : sink_len + self.mid_tokens].copy_(mid_v, non_blocking=True)
+                self.local_mid_ready[self.pending_idx] = True
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
@@ -344,15 +425,56 @@ class EchoTokenPrefetchRuntime:
     def current_middle_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
         mid = self.gpu_mid[self.active_idx]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         if self.eff_batch == 1 and bsz > 1:
-            mid = mid.expand(bsz, -1, -1, -1, -1).contiguous()
-        k_mid = mid[:, :, 0].contiguous()
-        v_mid = mid[:, :, 1].contiguous()
+            mid = mid[:1]
+        k_mid = mid[:, :, 0]
+        v_mid = mid[:, :, 1]
         return k_mid, v_mid
 
+    def _copy_window_ordered(self, dst_k: torch.Tensor, dst_v: torch.Tensor, offset: int):
+        win_len = self.win_len
+        if win_len <= 0:
+            return
+        if self.win_len < self.win_tokens or self.win_ptr == 0:
+            dst_k[:, offset : offset + win_len].copy_(
+                self.win_k[: self.eff_batch, :win_len], non_blocking=True
+            )
+            dst_v[:, offset : offset + win_len].copy_(
+                self.win_v[: self.eff_batch, :win_len], non_blocking=True
+            )
+            return
+        tail = self.win_tokens - self.win_ptr
+        dst_k[:, offset : offset + tail].copy_(
+            self.win_k[: self.eff_batch, self.win_ptr :], non_blocking=True
+        )
+        dst_v[:, offset : offset + tail].copy_(
+            self.win_v[: self.eff_batch, self.win_ptr :], non_blocking=True
+        )
+        dst_k[:, offset + tail : offset + self.win_tokens].copy_(
+            self.win_k[: self.eff_batch, : self.win_ptr], non_blocking=True
+        )
+        dst_v[:, offset + tail : offset + self.win_tokens].copy_(
+            self.win_v[: self.eff_batch, : self.win_ptr], non_blocking=True
+        )
+
     def local_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        k_mid, v_mid = self.current_middle_kv(bsz)
-        local_k = torch.cat([self.sink_k, k_mid, self.win_k], dim=1)
-        local_v = torch.cat([self.sink_v, v_mid, self.win_v], dim=1)
+        sink_len = self.sink_len
+        win_len = self.win_len
+        total = sink_len + self.mid_tokens + win_len
+        local_k = self.local_k_buf[self.active_idx][:, :total]
+        local_v = self.local_v_buf[self.active_idx][:, :total]
+        if not self.local_mid_ready[self.active_idx]:
+            k_mid, v_mid = self.current_middle_kv(bsz)
+            local_k[:, sink_len : sink_len + self.mid_tokens].copy_(k_mid, non_blocking=True)
+            local_v[:, sink_len : sink_len + self.mid_tokens].copy_(v_mid, non_blocking=True)
+            self.local_mid_ready[self.active_idx] = True
+        if sink_len > 0:
+            local_k[:, :sink_len].copy_(self.sink_k[: self.eff_batch, :sink_len], non_blocking=True)
+            local_v[:, :sink_len].copy_(self.sink_v[: self.eff_batch, :sink_len], non_blocking=True)
+        if win_len > 0:
+            self._copy_window_ordered(local_k, local_v, sink_len + self.mid_tokens)
+        k_mid = local_k[:, sink_len : sink_len + self.mid_tokens]
+        if self.eff_batch == 1 and bsz > 1:
+            return local_k[:1], local_v[:1], k_mid
         return local_k, local_v, k_mid
 
     def update_anchors_from_middle(self, q: torch.Tensor, k_mid: torch.Tensor):
@@ -370,9 +492,9 @@ class EchoTokenPrefetchRuntime:
         ).mean(dim=3).transpose(1, 2)  # [eff, n_kv_heads, 1, head_dim]
         km_t = eff_k_mid.transpose(1, 2).contiguous()  # [eff, n_kv_heads, mid_tokens, head_dim]
         scores = torch.matmul(grouped_q, km_t.transpose(2, 3)) / math.sqrt(self.head_dim)
-        probs = torch.softmax(scores, dim=-1)[:, :, 0, :]  # [eff, n_kv_heads, mid_tokens]
-
-        page_probs = probs.view(self.eff_batch, self.n_kv_heads, self.mid_pages, self.page_size)
+        page_probs = scores[:, :, 0, :].view(
+            self.eff_batch, self.n_kv_heads, self.mid_pages, self.page_size
+        )
         local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.long)
         anchors = starts + local_best
         anchors, _ = torch.sort(anchors, dim=-1)
@@ -381,8 +503,13 @@ class EchoTokenPrefetchRuntime:
     def attend(self, q: torch.Tensor, local_k: torch.Tensor, local_v: torch.Tensor) -> torch.Tensor:
         # q: [bsz, 1, n_qo_heads, head_dim]
         # local_k/local_v: [bsz, s, n_kv_heads, head_dim]
-        qh = q.transpose(1, 2).contiguous()        # [bsz, n_qo_heads, 1, head_dim]
-        kh = local_k.transpose(1, 2).contiguous()  # [bsz, n_kv_heads, s, head_dim]
+        bsz = q.shape[0]
+        if local_k.shape[0] != bsz:
+            q_use = q[:1]
+        else:
+            q_use = q
+        qh = q_use.transpose(1, 2).contiguous()        # [bsz, n_qo_heads, 1, head_dim]
+        kh = local_k.transpose(1, 2).contiguous()      # [bsz, n_kv_heads, s, head_dim]
         vh = local_v.transpose(1, 2).contiguous()
 
         try:
@@ -401,4 +528,7 @@ class EchoTokenPrefetchRuntime:
             out = F.scaled_dot_product_attention(
                 qh, kh, vh, attn_mask=None, dropout_p=0.0, is_causal=False
             )
-        return out.transpose(1, 2).contiguous()  # [bsz, 1, n_qo_heads, head_dim]
+        out = out.transpose(1, 2).contiguous()  # [bsz, 1, n_qo_heads, head_dim]
+        if out.shape[0] == 1 and bsz > 1:
+            out = out.expand(bsz, -1, -1, -1).contiguous()
+        return out

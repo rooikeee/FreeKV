@@ -243,15 +243,18 @@ class InferState:
         self.recall_stat_ms = []
         self.sel_stat_ms = []
         self.attn_stat_ms = []
+        self.pack_stat_ms = []
         self._perf_tot_ms = {
             "select": 0.0,
             "recall": 0.0,
             "attn": 0.0,
+            "pack": 0.0,
         }
         self._perf_pending = {
             "select": [],
             "recall": [],
             "attn": [],
+            "pack": [],
         }
         self.corr_checks = [0] * n_layers
         self.corr_triggers = [0] * n_layers
@@ -324,6 +327,7 @@ class InferState:
             "select": self.sel_stat_ms,
             "recall": self.recall_stat_ms,
             "attn": self.attn_stat_ms,
+            "pack": self.pack_stat_ms,
         }
         for sec, pairs in self._perf_pending.items():
             if not pairs:
@@ -341,6 +345,7 @@ class InferState:
         self.sel_stat_ms.clear()
         self.recall_stat_ms.clear()
         self.attn_stat_ms.clear()
+        self.pack_stat_ms.clear()
         for k in self._perf_tot_ms:
             self._perf_tot_ms[k] = 0.0
         for k in self._perf_pending:
@@ -352,9 +357,11 @@ class InferState:
             "select_ms": float(self._perf_tot_ms["select"]),
             "recall_ms": float(self._perf_tot_ms["recall"]),
             "attn_ms": float(self._perf_tot_ms["attn"]),
+            "pack_ms": float(self._perf_tot_ms["pack"]),
             "select_calls": len(self.sel_stat_ms),
             "recall_calls": len(self.recall_stat_ms),
             "attn_calls": len(self.attn_stat_ms),
+            "pack_calls": len(self.pack_stat_ms),
         }
         if reset:
             self.reset_perf_stats()
@@ -675,7 +682,9 @@ class InferState:
             # Fallback: no sparse-ready region, use dense paged decode.
             return self.decode_sdpa(layer_idx, q, self.kv_caches[layer_idx].c2p)
 
+        pack_t0 = self._perf_start("pack")
         local_k, local_v, k_mid = rt.local_kv(q.shape[0])
+        self._perf_stop("pack", pack_t0)
         attn_t0 = self._perf_start("attn")
         out = rt.attend(q, local_k, local_v)
         self._perf_stop("attn", attn_t0)

@@ -50,7 +50,7 @@ void recall_tokens_linear(
     starts_cpu = starts_cpu.to(torch::kInt32);
   }
   starts_cpu = starts_cpu.contiguous();
-  auto starts_acc = starts_cpu.accessor<int32_t, 2>();
+  const int32_t* starts_ptr = starts_cpu.data_ptr<int32_t>();
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -65,20 +65,35 @@ void recall_tokens_linear(
 
     for (int64_t b = 0; b < bsz; ++b) {
       const int64_t sb = (starts_bsz == 1) ? 0 : b;
-      for (int64_t p = 0; p < n_pages; ++p) {
-        const int64_t s = static_cast<int64_t>(starts_acc[sb][p]);
-        TORCH_CHECK(s >= 0 && s + page_size <= valid_tokens,
-                    "token start out of valid range: start=", s,
+      int64_t p = 0;
+      while (p < n_pages) {
+        const int64_t p0 = p;
+        const int64_t s0 = static_cast<int64_t>(starts_ptr[sb * n_pages + p0]);
+        TORCH_CHECK(s0 >= 0 && s0 + page_size <= valid_tokens,
+                    "token start out of valid range: start=", s0,
                     ", page_size=", page_size, ", valid_tokens=", valid_tokens);
-        scalar_t *src_ptr = src_base + b * src_stride_b + s * cpu_stride_tok;
-        scalar_t *dst_ptr = dst_base + b * dst_stride_b + (p * page_size) * gpu_stride_tok;
+        int64_t run_pages = 1;
+        while (p0 + run_pages < n_pages) {
+          const int64_t sn = static_cast<int64_t>(starts_ptr[sb * n_pages + p0 + run_pages]);
+          TORCH_CHECK(sn >= 0 && sn + page_size <= valid_tokens,
+                      "token start out of valid range: start=", sn,
+                      ", page_size=", page_size, ", valid_tokens=", valid_tokens);
+          if (sn != s0 + run_pages * page_size) {
+            break;
+          }
+          ++run_pages;
+        }
+        scalar_t *src_ptr = src_base + b * src_stride_b + s0 * cpu_stride_tok;
+        scalar_t *dst_ptr = dst_base + b * dst_stride_b + (p0 * page_size) * gpu_stride_tok;
+        const size_t run_bytes = page_bytes * static_cast<size_t>(run_pages);
         cudaError_t err = cudaMemcpyAsync(
             dst_ptr,
             src_ptr,
-            page_bytes,
+            run_bytes,
             cudaMemcpyHostToDevice,
             stream);
         TORCH_CHECK(err == cudaSuccess, "cudaMemcpyAsync failed: ", cudaGetErrorString(err));
+        p += run_pages;
       }
     }
     return true;
