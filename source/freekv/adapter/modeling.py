@@ -147,14 +147,25 @@ def _freekv_attn_forward(
                     evt.record(state.prefill_backup_stream)
                     state.prefill_backup_events[cur_id] = evt
                 state.prefill_save_digests(cur_id, key_states)
+                if state.echo_token:
+                    state.echo_token_on_prefill(
+                        cur_id,
+                        query_states[:, -1:, ...].contiguous(),
+                        key_states,
+                        value_states,
+                    )
             attn_output = state.prefill_sdpa(cur_id, query_states)
             infer_state.prefill_evict_extra_pages(
                 cur_id, query_states[:, -1:, ...].contiguous()
             )
         else:
+            if state.echo_token and budget is not None:
+                state.echo_token_on_decode_append(cur_id, key_states, value_states)
             attn_page_ids = kvc.c2p
             if budget is not None and kvc.n_pages > budget:
-                if state.spec_ret and cur_id not in NO_SPEC_RET_LAYER_SET:
+                if state.echo_token:
+                    attn_output = state.decode_echo_token(cur_id, query_states)
+                elif state.spec_ret and cur_id not in NO_SPEC_RET_LAYER_SET:
                     pending_events = state.spec_ret_recall_status[cur_id]
                     if pending_events is not None:
                         evt1, evt2 = pending_events

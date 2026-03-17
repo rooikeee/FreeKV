@@ -237,6 +237,13 @@ void recall_cuda_cpy_cpuhnd_2buf_pool(
     uint64_t event_handle2,
 		const torch::Tensor &need_recall_corr   // [bsz, n_kv_heads]
 );
+
+void recall_tokens_linear(
+    const torch::Tensor &token_starts,    // [bsz or 1, n_pages], int32
+    const torch::Tensor &cpu_kv_linear,   // [bsz, max_tokens, 2, n_kv_heads, head_dim], pinned cpu
+    torch::Tensor gpu_mid_kv,             // [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    int64_t valid_tokens
+);
 void init_recall_thread_pool(int num_threads);
 void shutdown_recall_thread_pool();
 

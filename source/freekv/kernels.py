@@ -420,6 +420,20 @@ def recall_cuda_cpy_cpuhnd_2buf_pool(
         kvc_buffer_gpu, n_groups, gs, nw, recall_buf1, recall_buf2, 
         stream1, stream2, event1, event2, need_recall_corr)
 
+
+def recall_tokens_linear(
+    token_starts,        # [bsz or 1, n_pages], int32
+    cpu_kv_linear,       # [bsz, max_tokens, 2, n_kv_heads, head_dim], pinned CPU
+    gpu_mid_kv,          # [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    valid_tokens: int,
+):
+    _cpp.recall_tokens_linear(
+        token_starts,
+        cpu_kv_linear,
+        gpu_mid_kv,
+        valid_tokens,
+    )
+
 def estimate_select_recall_pool(
     # for estimate
     query_states,

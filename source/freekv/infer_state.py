@@ -8,6 +8,7 @@ from torch import Tensor
 from .kv_cache import KvPool, KvCache
 from . import kernels
 from . import utils
+from .echo_token_runtime import EchoTokenPrefetchRuntime
 import atexit
 
 Digest = Tuple[Tensor, Tensor]
@@ -173,7 +174,20 @@ class InferState:
             n_groups = n_kv_heads // group_size
         self.group_size = group_size
         self.n_groups = n_groups
-        
+
+        self.sel_policy = kwargs.get("sel_policy", "topk")
+        assert self.sel_policy in ("topk", "echokv_token"), (
+            f"Unknown sel_policy: {self.sel_policy}"
+        )
+        self.echo_token = self.sel_policy == "echokv_token"
+        self.echo_num_anchors = int(kwargs.get("echo_num_anchors", 64))
+        self.echo_shared_batch = bool(kwargs.get("echo_shared_batch", True))
+        self.echo_use_cuda_token_recall = bool(
+            kwargs.get("echo_use_cuda_token_recall", True)
+        )
+        self.profile_timing = bool(kwargs.get("profile_timing", True))
+        assert self.echo_num_anchors > 0
+
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
         self.recall_buf1 = torch.empty((0), **self._fp)
@@ -228,8 +242,39 @@ class InferState:
 
         self.recall_stat_ms = []
         self.sel_stat_ms = []
+        self.attn_stat_ms = []
+        self._perf_tot_ms = {
+            "select": 0.0,
+            "recall": 0.0,
+            "attn": 0.0,
+        }
+        self._perf_pending = {
+            "select": [],
+            "recall": [],
+            "attn": [],
+        }
         self.corr_checks = [0] * n_layers
         self.corr_triggers = [0] * n_layers
+
+        self.echo_runtimes: List[Optional[EchoTokenPrefetchRuntime]] = [None] * n_layers
+        if self.echo_token:
+            for i in range(self.n_layers):
+                budget = self.layer2budget[i]
+                if budget is None:
+                    continue
+                mid_pages = max(0, self.layer2topk[i] or 0)
+                self.echo_runtimes[i] = EchoTokenPrefetchRuntime(
+                    n_qo_heads=self.n_qo_heads,
+                    n_kv_heads=self.n_kv_heads,
+                    head_dim=self.head_dim,
+                    page_size=self.page_size,
+                    n_sink_pages=self.n_sink_pages,
+                    n_win_pages=self.n_win_pages,
+                    mid_pages=mid_pages,
+                    seed_anchors=self.echo_num_anchors,
+                    shared_batch=self.echo_shared_batch,
+                    use_cuda_token_recall=self.echo_use_cuda_token_recall,
+                )
     
     def _shutdown_cpp_pool(self):
         try:
@@ -250,6 +295,71 @@ class InferState:
             "layer_triggers": self.corr_triggers,
         }
 
+    def _perf_start(self, section: str, stream: torch.cuda.Stream = None):
+        if (not self.profile_timing) or section not in self._perf_pending:
+            return None
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+        evt = torch.cuda.Event(enable_timing=True)
+        evt.record(stream)
+        return evt
+
+    def _perf_stop(self, section: str, start_evt, stream: torch.cuda.Stream = None):
+        if (not self.profile_timing) or start_evt is None:
+            return
+        if section not in self._perf_pending:
+            return
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+        end_evt = torch.cuda.Event(enable_timing=True)
+        end_evt.record(stream)
+        self._perf_pending[section].append((start_evt, end_evt))
+
+    def flush_perf_stats(self, synchronize: bool = True):
+        if not self.profile_timing:
+            return
+        if synchronize:
+            torch.cuda.synchronize(self.device)
+        sec2arr = {
+            "select": self.sel_stat_ms,
+            "recall": self.recall_stat_ms,
+            "attn": self.attn_stat_ms,
+        }
+        for sec, pairs in self._perf_pending.items():
+            if not pairs:
+                continue
+            arr = sec2arr[sec]
+            acc = self._perf_tot_ms[sec]
+            for s, e in pairs:
+                ms = float(s.elapsed_time(e))
+                arr.append(ms)
+                acc += ms
+            self._perf_tot_ms[sec] = acc
+            pairs.clear()
+
+    def reset_perf_stats(self):
+        self.sel_stat_ms.clear()
+        self.recall_stat_ms.clear()
+        self.attn_stat_ms.clear()
+        for k in self._perf_tot_ms:
+            self._perf_tot_ms[k] = 0.0
+        for k in self._perf_pending:
+            self._perf_pending[k].clear()
+
+    def get_perf_stats(self, synchronize: bool = True, reset: bool = False):
+        self.flush_perf_stats(synchronize=synchronize)
+        out = {
+            "select_ms": float(self._perf_tot_ms["select"]),
+            "recall_ms": float(self._perf_tot_ms["recall"]),
+            "attn_ms": float(self._perf_tot_ms["attn"]),
+            "select_calls": len(self.sel_stat_ms),
+            "recall_calls": len(self.recall_stat_ms),
+            "attn_calls": len(self.attn_stat_ms),
+        }
+        if reset:
+            self.reset_perf_stats()
+        return out
+
     @property
     def seq_len(self):
         return self.kv_caches[0].seq_len
@@ -263,6 +373,12 @@ class InferState:
         return self.kv_caches[0].batch_size
 
     def _prepare_prefill(self, bsz, q_len):
+        if self.echo_token:
+            for rt in self.echo_runtimes:
+                if rt is None:
+                    continue
+                rt.ensure(bsz, self.device, self.dtype)
+                rt.reset_state()
         self._pool.clear()
         self.kv_caches = [
             KvCache(
@@ -504,6 +620,77 @@ class InferState:
         )
         return eids, rids
 
+    def echo_token_on_prefill(
+        self,
+        layer_idx: int,
+        q_last: Tensor,   # [bsz, 1, n_qo_heads, head_dim]
+        k_full: Tensor,   # [bsz, q_len, n_kv_heads, head_dim]
+        v_full: Tensor,   # [bsz, q_len, n_kv_heads, head_dim]
+    ):
+        if not self.echo_token:
+            return
+        rt = self.echo_runtimes[layer_idx]
+        if rt is None:
+            return
+        rt.ensure(q_last.shape[0], self.device, self.dtype)
+        rt.copy_prefill_to_cpu(k_full, v_full)
+        sel_t0 = self._perf_start("select")
+        rt.init_anchors_from_prefill(q_last, k_full)
+        self._perf_stop("select", sel_t0)
+        starts = rt.build_starts(rt.cpu_len + 1)
+        if starts is not None:
+            rec_t0 = self._perf_start("recall", stream=rt.recall_stream)
+            rt.launch_prefetch(starts, target_seq_len=rt.cpu_len + 1)
+            self._perf_stop("recall", rec_t0, stream=rt.recall_stream)
+
+    def echo_token_on_decode_append(
+        self,
+        layer_idx: int,
+        k_tok: Tensor,    # [bsz, 1, n_kv_heads, head_dim]
+        v_tok: Tensor,    # [bsz, 1, n_kv_heads, head_dim]
+    ):
+        if not self.echo_token:
+            return
+        rt = self.echo_runtimes[layer_idx]
+        if rt is None:
+            return
+        rt.ensure(k_tok.shape[0], self.device, self.dtype)
+        rt.append_decode_token_to_cpu(k_tok, v_tok)
+
+    def decode_echo_token(self, layer_idx: int, q: Tensor):
+        # q: [bsz, 1, n_qo_heads, head_dim]
+        rt = self.echo_runtimes[layer_idx]
+        assert rt is not None
+        cur_seq = rt.cpu_len
+        starts = rt.build_starts(cur_seq)
+        if starts is not None and (
+            (not rt.prefetch_ready) or (rt.pending_seq_len != int(cur_seq))
+        ):
+            rec_t0 = self._perf_start("recall", stream=rt.recall_stream)
+            rt.launch_prefetch(starts, target_seq_len=cur_seq)
+            self._perf_stop("recall", rec_t0, stream=rt.recall_stream)
+
+        ok = rt.activate_prefetch(cur_seq, self.compute_stream)
+        if not ok:
+            # Fallback: no sparse-ready region, use dense paged decode.
+            return self.decode_sdpa(layer_idx, q, self.kv_caches[layer_idx].c2p)
+
+        local_k, local_v, k_mid = rt.local_kv(q.shape[0])
+        attn_t0 = self._perf_start("attn")
+        out = rt.attend(q, local_k, local_v)
+        self._perf_stop("attn", attn_t0)
+
+        sel_t0 = self._perf_start("select")
+        rt.update_anchors_from_middle(q, k_mid)
+        self._perf_stop("select", sel_t0)
+
+        next_starts = rt.build_starts(cur_seq + 1)
+        if next_starts is not None:
+            rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+            rt.launch_prefetch(next_starts, target_seq_len=cur_seq + 1)
+            self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+        return out
+
     def recall(self, layer_idx: int, 
                eids: Tensor, rids: Tensor, 
                blocking=True,
@@ -521,6 +708,8 @@ class InferState:
         impl = self.recall_impl
 
         torch.cuda.nvtx.range_push("recall")
+        rec_stream = torch.cuda.current_stream(self.device)
+        rec_t0 = self._perf_start("recall", stream=rec_stream)
         if impl == "arkvale":
             for i in range(kvc.batch_size):
                 for j in range(self.n_groups):
@@ -567,20 +756,25 @@ class InferState:
             else:
                 kernels.recall(rids, eids, cpu_kvc.c2p, cpu_kvc.buffer, kvc.buffer, 
                                 ng, gs, nw, impl, cpu_kvc.layout, self.recall_buf1)
+        self._perf_stop("recall", rec_t0, stream=rec_stream)
         torch.cuda.nvtx.range_pop()
 
     def estimate_select_recall(self, layer_idx: int, q: Tensor):
         torch.cuda.nvtx.range_push("score&topk")
+        sel_t0 = self._perf_start("select")
         scores = self.estimate_scores(layer_idx, q)
         eids, rids = self.select_topk(layer_idx, scores)
+        self._perf_stop("select", sel_t0)
         torch.cuda.nvtx.range_pop()
 
         self.recall(layer_idx, eids, rids, blocking=True, need_recall_corr=torch.Tensor())
 
     def estimate_select(self, layer_idx: int, q: Tensor):
         torch.cuda.nvtx.range_push("score&topk")
+        sel_t0 = self._perf_start("select")
         scores = self.estimate_scores(layer_idx, q)
         eids, rids = self.select_topk(layer_idx, scores)
+        self._perf_stop("select", sel_t0)
         torch.cuda.nvtx.range_pop()
         return eids, rids
 
@@ -609,6 +803,7 @@ class InferState:
         rs_group = layer_idx % (self.n_recall_stream // 2)
         recall_stream1 = self.recall_streams[rs_group*2]
         recall_stream2 = self.recall_streams[rs_group*2 + 1]
+        rec_t0 = self._perf_start("recall", stream=recall_stream1)
         kernels.estimate_select_recall_pool(
             # for estimate
             q, dgc.buffer, dgc.c2p, dgc.seq_len,
@@ -624,6 +819,7 @@ class InferState:
             recall_stream1.cuda_stream, recall_stream2.cuda_stream,
             recall_evt1.cuda_event, recall_evt2.cuda_event
         )
+        self._perf_stop("recall", rec_t0, stream=recall_stream1)
 
     def prefill_backup_pages(self, layer_idx: int):
         kvc = self.kv_caches[layer_idx]
@@ -750,4 +946,7 @@ class InferState:
         kvc = self.kv_caches[layer_idx]
         if page_ids is None:
             page_ids = kvc.c2p
-        return self.decode_handler_tab[kvc.budget].forward(q, kvc.buffer, page_ids)
+        attn_t0 = self._perf_start("attn")
+        out = self.decode_handler_tab[kvc.budget].forward(q, kvc.buffer, page_ids)
+        self._perf_stop("attn", attn_t0)
+        return out

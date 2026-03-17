@@ -29,6 +29,7 @@ PYBIND11_MODULE(freekv_cpp, m) {
 	m.def("recall_cuda_cpy", &recall_cuda_cpy);
 	m.def("recall_cuda_cpy_cpuhnd_2buf", &recall_cuda_cpy_cpuhnd_2buf);
 	m.def("recall_cuda_cpy_cpuhnd_2buf_pool", &recall_cuda_cpy_cpuhnd_2buf_pool);
+	m.def("recall_tokens_linear", &recall_tokens_linear);
 	m.def("init_recall_thread_pool", &init_recall_thread_pool);
 	m.def("shutdown_recall_thread_pool", &shutdown_recall_thread_pool);
 	m.def("estimate_select_recall_pool", &estimate_select_recall_pool);

@@ -108,6 +108,20 @@ def parse_args(args=None):
     parser.add_argument("--recall_impl", type=str, default="cuda_cpy",
                         choices=["arkvale", "torch_cpy", "cuda_cpy"], help="Recall implementation")
     parser.add_argument("--corr", type=float, default=None, help="Correction threshold (cosine similarity); None to disable")
+    parser.add_argument("--sel_policy", type=str, default="topk",
+                        choices=["topk", "echokv_token"],
+                        help="Selection policy")
+    parser.add_argument("--echo_num_anchors", type=int, default=64,
+                        help="Number of seed anchors for EchoKV-token")
+    parser.add_argument("--echo_shared_batch", dest="echo_shared_batch", action="store_true",
+                        help="Use batch-0 shared anchors/recall for repeated batch decoding")
+    parser.add_argument("--echo_no_shared_batch", dest="echo_shared_batch", action="store_false",
+                        help="Disable shared-batch optimization for EchoKV-token")
+    parser.set_defaults(echo_shared_batch=True)
+    parser.add_argument("--echo_disable_cuda_token_recall", action="store_true",
+                        help="Force disable custom cuda token-recall kernel")
+    parser.add_argument("--disable_profile_timing", action="store_true",
+                        help="Disable CUDA event timing for select/recall/attn")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup generation rounds before timing")
 
     return parser.parse_args(args)
@@ -136,6 +150,8 @@ def load_model_and_tokenizer(path):
     print(f"\n{CYAN}{SEP}")
     print(f"  KV Cache Config: token_budget={token_budgets}, page_budget={page_budgets}, "
           f"page_size={page_size}, sink={args.sink}, recent={args.recent}")
+    print(f"  Echo Config: sel_policy={args.sel_policy}, seed_anchors={args.echo_num_anchors}, "
+          f"shared_batch={args.echo_shared_batch}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
         infer_state = adapter.enable_offload(
@@ -156,6 +172,11 @@ def load_model_and_tokenizer(path):
             n_recall_stream=args.n_recall_stream,
             recall_impl=args.recall_impl,
             corr=args.corr,
+            sel_policy=args.sel_policy,
+            echo_num_anchors=args.echo_num_anchors,
+            echo_shared_batch=args.echo_shared_batch,
+            echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
+            profile_timing=(not args.disable_profile_timing),
         )
     else:
         assert not args.spec_ret
@@ -177,6 +198,7 @@ def get_pred(
     model,
     tokenizer,
     eos_token_ids,
+    infer_state,
     data,
     answer_field_id,
     max_length,
@@ -222,16 +244,23 @@ def get_pred(
                     )
                 print(f"{YELLOW}[Warmup] Done.{RESET}")
                 model.tbt_stat_ms.clear()
+            infer_state.reset_perf_stats()
 
             st = time.perf_counter()
             output = generate_once(
                 model, input, max_gen, temperature, eos_token_ids, tokenizer.eos_token_id
             )
             ed = time.perf_counter()
+        perf = infer_state.get_perf_stats(synchronize=True, reset=False)
         
         gen_token = [len(o) - len(i) for o, i in zip(output, input)]
         decode_ms = model.tbt_stat_ms[1:]
         avg_tbt = sum(decode_ms) / len(decode_ms) if decode_ms else 0.0
+        decode_total_ms = sum(decode_ms) if decode_ms else 0.0
+        select_ms = perf["select_ms"]
+        recall_ms = perf["recall_ms"]
+        attn_ms = perf["attn_ms"]
+        other_decode_ms = max(0.0, decode_total_ms - select_ms - recall_ms - attn_ms)
 
         print(f"\n{GREEN}{SEP}")
         print(f"  [{model_name}] Generation Summary")
@@ -240,6 +269,10 @@ def get_pred(
         print(f"  Total time       : {sum(model.tbt_stat_ms)/1000:.2f}s")
         print(f"  Decode time      : {sum(decode_ms)/1000:.2f}s")
         print(f"  Avg TBT (decode) : {avg_tbt:.2f} ms")
+        print(f"  Select time      : {select_ms/1000:.2f}s ({perf['select_calls']} calls)")
+        print(f"  Recall time      : {recall_ms/1000:.2f}s ({perf['recall_calls']} calls)")
+        print(f"  Decode attn time : {attn_ms/1000:.2f}s ({perf['attn_calls']} calls)")
+        print(f"  Decode other     : {other_decode_ms/1000:.2f}s")
         print(f"{GREEN}{SEP}{RESET}\n")
         for b in range(len(output)):
             pred = tokenizer.decode(output[b], skip_special_tokens=True)
@@ -293,6 +326,7 @@ if __name__ == "__main__":
         model,
         tokenizer,
         eos_token_ids,
+        infer_state,
         data,
         answer_field_id,
         max_length,
