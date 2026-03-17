@@ -77,10 +77,9 @@ class EchoTokenPrefetchRuntime:
         self.page_kv_buf = [None, None]  # [eff, local_pages, 2, page_size, n_kv_heads, head_dim]
         self.page_mid_ready = [False, False]
         self.page_sink_ready = [False, False]
+        self.page_win_ready = [False, False]
         self.page_ids = None  # [bsz, local_pages], int32
         self.page_ids_bsz = 0
-        self.win_pack_k = None  # [eff, win_tokens, n_kv_heads, head_dim]
-        self.win_pack_v = None
 
         self.gpu_mid = [None, None]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         self.pending_idx = 0
@@ -179,16 +178,6 @@ class EchoTokenPrefetchRuntime:
             self.page_kv_buf[1] = torch.empty_like(self.page_kv_buf[0])
         else:
             self.page_kv_buf = [None, None]
-        if self.win_tokens > 0:
-            self.win_pack_k = torch.empty(
-                (eff_bsz, self.win_tokens, self.n_kv_heads, self.head_dim),
-                dtype=dtype,
-                device=device,
-            )
-            self.win_pack_v = torch.empty_like(self.win_pack_k)
-        else:
-            self.win_pack_k = None
-            self.win_pack_v = None
         self.reset_state()
 
     def reset_state(self):
@@ -212,6 +201,7 @@ class EchoTokenPrefetchRuntime:
         self.local_sink_len_cached = [0, 0]
         self.page_mid_ready = [False, False]
         self.page_sink_ready = [False, False]
+        self.page_win_ready = [False, False]
         self.page_ids = None
         self.page_ids_bsz = 0
         self._head_idx = None
@@ -286,6 +276,7 @@ class EchoTokenPrefetchRuntime:
 
         self._sync_sink_to_local_buffers()
         self._sync_sink_to_page_buffers()
+        self._sync_window_to_page_buffers_full()
 
     def append_decode_token_to_cpu(
         self,
@@ -320,9 +311,12 @@ class EchoTokenPrefetchRuntime:
                 self.win_k[:, :, self.win_len : self.win_len + 1].copy_(k_tok_h, non_blocking=True)
                 self.win_v[:, :, self.win_len : self.win_len + 1].copy_(v_tok_h, non_blocking=True)
                 self.win_len += 1
+                self._sync_window_to_page_buffers_full()
             else:
-                self.win_k[:, :, self.win_ptr : self.win_ptr + 1].copy_(k_tok_h, non_blocking=True)
-                self.win_v[:, :, self.win_ptr : self.win_ptr + 1].copy_(v_tok_h, non_blocking=True)
+                write_slot = self.win_ptr
+                self.win_k[:, :, write_slot : write_slot + 1].copy_(k_tok_h, non_blocking=True)
+                self.win_v[:, :, write_slot : write_slot + 1].copy_(v_tok_h, non_blocking=True)
+                self._update_window_token_in_page_buffers(write_slot, k_tok_h, v_tok_h)
                 self.win_ptr = (self.win_ptr + 1) % self.win_tokens
 
     def middle_bounds(self, seq_len: int) -> Optional[Tuple[int, int]]:
@@ -374,6 +368,45 @@ class EchoTokenPrefetchRuntime:
             pbuf[:, : self.n_sink_pages, 1].copy_(sink_v_pages, non_blocking=True)
             self.page_sink_ready[i] = True
 
+    def _sync_window_to_page_buffers_full(self):
+        if self.win_len < self.win_tokens or self.n_win_pages <= 0:
+            return
+        off = self.n_sink_pages + self.mid_pages
+        win_pages_k = self.win_k[: self.eff_batch].transpose(1, 2).reshape(
+            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        win_pages_v = self.win_v[: self.eff_batch].transpose(1, 2).reshape(
+            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        for i in (0, 1):
+            if self.page_win_ready[i]:
+                continue
+            pbuf = self.page_kv_buf[i]
+            if pbuf is None:
+                continue
+            pbuf[:, off : off + self.n_win_pages, 0].copy_(win_pages_k, non_blocking=True)
+            pbuf[:, off : off + self.n_win_pages, 1].copy_(win_pages_v, non_blocking=True)
+            self.page_win_ready[i] = True
+
+    def _update_window_token_in_page_buffers(
+        self, slot: int, k_tok_h: torch.Tensor, v_tok_h: torch.Tensor
+    ):
+        if self.n_win_pages <= 0:
+            return
+        page_idx = int(slot // self.page_size)
+        tok_off = int(slot % self.page_size)
+        off = self.n_sink_pages + self.mid_pages + page_idx
+        k_src = k_tok_h[: self.eff_batch, :, 0, :]
+        v_src = v_tok_h[: self.eff_batch, :, 0, :]
+        for i in (0, 1):
+            if not self.page_win_ready[i]:
+                continue
+            pbuf = self.page_kv_buf[i]
+            if pbuf is None:
+                continue
+            pbuf[:, off, 0, tok_off].copy_(k_src, non_blocking=True)
+            pbuf[:, off, 1, tok_off].copy_(v_src, non_blocking=True)
+
     def _ensure_page_ids(self, bsz: int):
         if self.local_pages <= 0:
             self.page_ids = None
@@ -396,38 +429,9 @@ class EchoTokenPrefetchRuntime:
         win_len = self.win_len
         if win_len < self.win_tokens or self.n_win_pages <= 0:
             return
-        off = self.n_sink_pages + self.mid_pages
-        if self.win_ptr == 0:
-            win_tok = self.win_k[: self.eff_batch].transpose(1, 2)
-            win_tok_v = self.win_v[: self.eff_batch].transpose(1, 2)
-        else:
-            win_tok = self.win_pack_k
-            win_tok_v = self.win_pack_v
-            tail = self.win_tokens - self.win_ptr
-            win_tok[:, :tail].copy_(
-                self.win_k[: self.eff_batch, :, self.win_ptr :].transpose(1, 2),
-                non_blocking=True,
-            )
-            win_tok[:, tail:].copy_(
-                self.win_k[: self.eff_batch, :, : self.win_ptr].transpose(1, 2),
-                non_blocking=True,
-            )
-            win_tok_v[:, :tail].copy_(
-                self.win_v[: self.eff_batch, :, self.win_ptr :].transpose(1, 2),
-                non_blocking=True,
-            )
-            win_tok_v[:, tail:].copy_(
-                self.win_v[: self.eff_batch, :, : self.win_ptr].transpose(1, 2),
-                non_blocking=True,
-            )
-        win_pages = win_tok.reshape(
-            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
-        )
-        dst_pages[:, off : off + self.n_win_pages, 0].copy_(win_pages, non_blocking=True)
-        win_pages_v = win_tok_v.reshape(
-            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
-        )
-        dst_pages[:, off : off + self.n_win_pages, 1].copy_(win_pages_v, non_blocking=True)
+        # For q_len=1 with non-causal attention, key/value permutation is output-invariant.
+        # Keep ring order and avoid per-step reordering/copying.
+        self._sync_window_to_page_buffers_full()
 
     def _get_head_index(self, device: torch.device):
         if self.anchor_head_sample <= 0 or self.anchor_head_sample >= self.n_kv_heads:
@@ -664,26 +668,12 @@ class EchoTokenPrefetchRuntime:
         win_len = self.win_len
         if win_len <= 0:
             return
-        if self.win_len < self.win_tokens or self.win_ptr == 0:
-            dst_k[:, :, offset : offset + win_len].copy_(
-                self.win_k[: self.eff_batch, :, :win_len], non_blocking=True
-            )
-            dst_v[:, :, offset : offset + win_len].copy_(
-                self.win_v[: self.eff_batch, :, :win_len], non_blocking=True
-            )
-            return
-        tail = self.win_tokens - self.win_ptr
-        dst_k[:, :, offset : offset + tail].copy_(
-            self.win_k[: self.eff_batch, :, self.win_ptr :], non_blocking=True
+        # Permutation of keys/values does not change attention output for single-query non-causal decode.
+        dst_k[:, :, offset : offset + win_len].copy_(
+            self.win_k[: self.eff_batch, :, :win_len], non_blocking=True
         )
-        dst_v[:, :, offset : offset + tail].copy_(
-            self.win_v[: self.eff_batch, :, self.win_ptr :], non_blocking=True
-        )
-        dst_k[:, :, offset + tail : offset + self.win_tokens].copy_(
-            self.win_k[: self.eff_batch, :, : self.win_ptr], non_blocking=True
-        )
-        dst_v[:, :, offset + tail : offset + self.win_tokens].copy_(
-            self.win_v[: self.eff_batch, :, : self.win_ptr], non_blocking=True
+        dst_v[:, :, offset : offset + win_len].copy_(
+            self.win_v[: self.eff_batch, :, :win_len], non_blocking=True
         )
 
     def local_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
