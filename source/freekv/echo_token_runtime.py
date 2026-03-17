@@ -501,7 +501,7 @@ class EchoTokenPrefetchRuntime:
         seed, _ = torch.sort(seed, dim=-1)
         anchors = self._expand_seed_anchors(seed)
         anchors, _ = torch.sort(anchors, dim=-1)
-        self.anchors = anchors
+        self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
 
     def _tile_starts(self, anchors: torch.Tensor, lower: int, upper: int) -> torch.Tensor:
         # anchors: [eff_bsz, mid_pages]
@@ -525,7 +525,7 @@ class EchoTokenPrefetchRuntime:
         y2 = starts - penalty.view(1, -1)
         starts = torch.cummax(y2, dim=-1).values + penalty.view(1, -1)
         starts = torch.clamp(starts, min=lower, max=max_start)
-        return starts
+        return starts.to(dtype=torch.int32).contiguous()
 
     def build_starts(self, seq_len: int) -> Optional[torch.Tensor]:
         if self.mid_pages <= 0 or self.anchors is None:
@@ -548,6 +548,37 @@ class EchoTokenPrefetchRuntime:
                     non_blocking=True,
                 )
 
+    def _delta_recall_from_active(self, starts_cpu_i32: torch.Tensor, out_buf: torch.Tensor) -> bool:
+        # Reuse previous active middle buffer and patch only changed pages.
+        if self.active_starts is None:
+            return False
+        prev = self.active_starts
+        if prev.device.type != "cpu":
+            return False
+        if prev.shape != starts_cpu_i32.shape:
+            return False
+        changed = starts_cpu_i32.ne(prev)
+        changed_cnt = int(changed.sum().item())
+        if changed_cnt <= 0:
+            out_buf.copy_(self.gpu_mid[self.active_idx], non_blocking=True)
+            return True
+        total = int(starts_cpu_i32.numel())
+        if changed_cnt > int(0.75 * total):
+            return False
+
+        out_buf.copy_(self.gpu_mid[self.active_idx], non_blocking=True)
+        for b in range(changed.shape[0]):
+            idxs = torch.nonzero(changed[b], as_tuple=False).flatten()
+            for p_t in idxs:
+                p = int(p_t.item())
+                s = int(starts_cpu_i32[b, p].item())
+                e = s + self.page_size
+                out_buf[b, p * self.page_size : (p + 1) * self.page_size].copy_(
+                    self.cpu_kv[b, s:e],
+                    non_blocking=True,
+                )
+        return True
+
     def launch_prefetch(self, starts: torch.Tensor, target_seq_len: int):
         # starts: [eff_bsz, mid_pages]
         if self.mid_pages <= 0 or starts is None:
@@ -557,14 +588,16 @@ class EchoTokenPrefetchRuntime:
         self.local_mid_ready[self.pending_idx] = False
         self.page_mid_ready[self.pending_idx] = False
         out_buf = self.gpu_mid[self.pending_idx]
-        if starts.dtype == torch.int32 and starts.device == self.device and starts.is_contiguous():
-            starts_i32 = starts
+        if starts.dtype != torch.int32 or (not starts.is_contiguous()):
+            starts_i32 = starts.to(dtype=torch.int32).contiguous()
         else:
-            starts_i32 = starts.to(device=self.device, dtype=torch.int32).contiguous()
+            starts_i32 = starts
+        starts_cpu = starts_i32 if starts_i32.device.type == "cpu" else starts_i32.to("cpu")
 
         with torch.cuda.stream(self.recall_stream):
             used_cuda = False
-            if self.use_cuda_token_recall and hasattr(kernels, "recall_tokens_linear"):
+            used_delta = self._delta_recall_from_active(starts_cpu, out_buf)
+            if (not used_delta) and self.use_cuda_token_recall and hasattr(kernels, "recall_tokens_linear"):
                 try:
                     kernels.recall_tokens_linear(
                         starts_i32,
@@ -575,8 +608,8 @@ class EchoTokenPrefetchRuntime:
                     used_cuda = True
                 except Exception:
                     used_cuda = False
-            if not used_cuda:
-                self._fallback_recall(starts, out_buf)
+            if (not used_delta) and (not used_cuda):
+                self._fallback_recall(starts_cpu, out_buf)
             if self.local_k_buf[self.pending_idx] is not None:
                 local_k = self.local_k_buf[self.pending_idx]
                 local_v = self.local_v_buf[self.pending_idx]
@@ -720,7 +753,7 @@ class EchoTokenPrefetchRuntime:
         local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         anchors = starts + local_best
         anchors, _ = torch.sort(anchors, dim=-1)
-        self.anchors = anchors
+        self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
 
     def update_anchors_from_active_mid(self, q: torch.Tensor):
         # Use active gpu_mid directly to avoid extra permute/contiguous on flashinfer path.
@@ -743,9 +776,10 @@ class EchoTokenPrefetchRuntime:
             self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
         )
         local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
-        anchors = self.active_starts + local_best
+        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
+        anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
-        self.anchors = anchors
+        self.anchors = anchors.to(dtype=torch.int32).contiguous()
 
     def attend(self, q: torch.Tensor, local_k: torch.Tensor, local_v: torch.Tensor) -> torch.Tensor:
         # q: [bsz, 1, n_qo_heads, head_dim]
