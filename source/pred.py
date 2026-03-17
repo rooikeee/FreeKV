@@ -120,6 +120,9 @@ def parse_args(args=None):
                         help="Number of seed anchors for EchoKV-token")
     parser.add_argument("--echo_anchor_head_sample", type=int, default=0,
                         help="Sampled KV heads for anchor scoring (0=all heads)")
+    parser.add_argument("--echo_attn_backend", type=str, default="sdpa",
+                        choices=["sdpa", "flashinfer"],
+                        help="Attention backend for EchoKV-token decode")
     parser.add_argument("--echo_shared_batch", dest="echo_shared_batch", action="store_true",
                         help="Use batch-0 shared anchors/recall for repeated batch decoding")
     parser.add_argument("--echo_no_shared_batch", dest="echo_shared_batch", action="store_false",
@@ -158,7 +161,8 @@ def load_model_and_tokenizer(path):
     print(f"  KV Cache Config: token_budget={token_budgets}, page_budget={page_budgets}, "
           f"page_size={page_size}, sink={args.sink}, recent={args.recent}")
     print(f"  Echo Config: sel_policy={args.sel_policy}, seed_anchors={args.echo_num_anchors}, "
-          f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}")
+          f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}, "
+          f"attn_backend={args.echo_attn_backend}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
         infer_state = adapter.enable_offload(
@@ -182,6 +186,7 @@ def load_model_and_tokenizer(path):
             sel_policy=args.sel_policy,
             echo_num_anchors=args.echo_num_anchors,
             echo_anchor_head_sample=args.echo_anchor_head_sample,
+            echo_attn_backend=args.echo_attn_backend,
             echo_shared_batch=args.echo_shared_batch,
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             profile_timing=(not args.disable_profile_timing),
@@ -219,34 +224,40 @@ def get_pred(
 ):
     preds = []
     for json_obj in tqdm(data):
+        prep_t0 = time.perf_counter()
         if prompt_format is not None:
             prompt = prompt_format.format(**json_obj)
         else:
             prompt = json_obj["prompt"]
-        tokenized_prompt = tokenizer(
-            prompt, truncation=False, return_tensors="pt"
-        ).input_ids[0]
-        if expand_prompt_to_max_length and len(tokenized_prompt) > 8192 and len(tokenized_prompt) < max_length:
-            # only for long inputs
-            print(
-                f"{YELLOW}[PromptExpand] input_len={len(tokenized_prompt)} in (8192, {max_length}), "
-                f"expanding to ~{max_length} for stress mode.{RESET}"
-            )
-            tokenized_prompt = tokenized_prompt.repeat(max_length // len(tokenized_prompt) + 1)
-            assert len(tokenized_prompt) > max_length
-        if len(tokenized_prompt) > max_length:
-            half = int(max_length / 2)
-            prompt = tokenizer.decode(
-                tokenized_prompt[:half], skip_special_tokens=True
-            ) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-        
+
         chat_prompt = build_chat(tokenizer, prompt, model_name)
         if isinstance(chat_prompt, str):
-            input = tokenizer(chat_prompt, truncation=False, return_tensors="pt").to("cuda").input_ids
+            input_ids = tokenizer(chat_prompt, truncation=False, return_tensors="pt").input_ids
         else:
-            input = chat_prompt
+            input_ids = chat_prompt
+
+        src_len = int(input_ids.shape[-1])
+        if expand_prompt_to_max_length and src_len > 8192 and src_len < max_length:
+            print(
+                f"{YELLOW}[PromptExpand] input_len={src_len} in (8192, {max_length}), "
+                f"expanding to ~{max_length} for stress mode.{RESET}"
+            )
+            rep = max_length // src_len + 1
+            input_ids = input_ids.repeat(1, rep)
+            src_len = int(input_ids.shape[-1])
+
+        if src_len > max_length:
+            left = max_length // 2
+            right = max_length - left
+            input_ids = torch.cat([input_ids[:, :left], input_ids[:, -right:]], dim=-1)
+
+        input = input_ids.to("cuda")
         prompt_length = input.shape[-1]
-        print(f"{CYAN}[Input] prompt_length={prompt_length}, dtype={input.dtype}, device={input.device}{RESET}")
+        prep_ms = (time.perf_counter() - prep_t0) * 1000.0
+        print(
+            f"{CYAN}[Input] prompt_length={prompt_length}, dtype={input.dtype}, "
+            f"device={input.device}, prep={prep_ms:.1f}ms{RESET}"
+        )
         input = input.repeat(args.repeat_bsz, 1)
         with torch.no_grad():
             if warmup > 0:
@@ -267,6 +278,7 @@ def get_pred(
         perf = infer_state.get_perf_stats(synchronize=True, reset=False)
         
         gen_token = [len(o) - len(i) for o, i in zip(output, input)]
+        prefill_ms = model.tbt_stat_ms[0] if model.tbt_stat_ms else 0.0
         decode_ms = model.tbt_stat_ms[1:]
         avg_tbt = sum(decode_ms) / len(decode_ms) if decode_ms else 0.0
         decode_total_ms = sum(decode_ms) if decode_ms else 0.0
@@ -281,6 +293,7 @@ def get_pred(
         print(f"{SEP}{RESET}")
         print(f"  Tokens generated : {gen_token}")
         print(f"  Total time       : {sum(model.tbt_stat_ms)/1000:.2f}s")
+        print(f"  Prefill time     : {prefill_ms/1000:.2f}s")
         print(f"  Decode time      : {sum(decode_ms)/1000:.2f}s")
         print(f"  Avg TBT (decode) : {avg_tbt:.2f} ms")
         print(f"  Select time      : {select_ms/1000:.2f}s ({perf['select_calls']} calls)")

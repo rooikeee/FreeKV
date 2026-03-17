@@ -47,6 +47,7 @@ class EchoTokenPrefetchRuntime:
 
         self.sink_tokens = self.n_sink_pages * self.page_size
         self.win_tokens = self.n_win_pages * self.page_size
+        self.local_pages = self.n_sink_pages + self.mid_pages + self.n_win_pages
 
         self.device: Optional[torch.device] = None
         self.dtype: Optional[torch.dtype] = None
@@ -73,6 +74,11 @@ class EchoTokenPrefetchRuntime:
         self.local_mid_ready = [False, False]
         self.local_total_cap = self.sink_tokens + self.mid_tokens + self.win_tokens
         self.local_sink_len_cached = [0, 0]
+        self.page_kv_buf = [None, None]  # [eff, local_pages, 2, page_size, n_kv_heads, head_dim]
+        self.page_mid_ready = [False, False]
+        self.page_sink_ready = [False, False]
+        self.page_ids = None  # [bsz, local_pages], int32
+        self.page_ids_bsz = 0
 
         self.gpu_mid = [None, None]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         self.pending_idx = 0
@@ -155,6 +161,22 @@ class EchoTokenPrefetchRuntime:
         else:
             self.local_k_buf = [None, None]
             self.local_v_buf = [None, None]
+        if self.local_pages > 0:
+            self.page_kv_buf[0] = torch.empty(
+                (
+                    eff_bsz,
+                    self.local_pages,
+                    2,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                ),
+                dtype=dtype,
+                device=device,
+            )
+            self.page_kv_buf[1] = torch.empty_like(self.page_kv_buf[0])
+        else:
+            self.page_kv_buf = [None, None]
         self.reset_state()
 
     def reset_state(self):
@@ -176,6 +198,10 @@ class EchoTokenPrefetchRuntime:
         self.prefetch_ready = False
         self.local_mid_ready = [False, False]
         self.local_sink_len_cached = [0, 0]
+        self.page_mid_ready = [False, False]
+        self.page_sink_ready = [False, False]
+        self.page_ids = None
+        self.page_ids_bsz = 0
         self._head_idx = None
 
     def _maybe_expand_cpu(self, needed_tokens: int):
@@ -247,6 +273,7 @@ class EchoTokenPrefetchRuntime:
             self.win_v = None
 
         self._sync_sink_to_local_buffers()
+        self._sync_sink_to_page_buffers()
 
     def append_decode_token_to_cpu(
         self,
@@ -274,6 +301,7 @@ class EchoTokenPrefetchRuntime:
                 self.sink_v[:, :, self.sink_len : self.sink_len + 1].copy_(v_tok_h, non_blocking=True)
                 self.sink_len += 1
                 self._sync_sink_to_local_buffers()
+                self._sync_sink_to_page_buffers()
 
         if self.win_tokens > 0:
             if self.win_len < self.win_tokens:
@@ -312,6 +340,89 @@ class EchoTokenPrefetchRuntime:
                 self.sink_v[: self.eff_batch, :, : self.sink_len], non_blocking=True
             )
             self.local_sink_len_cached[i] = self.sink_len
+
+    def _sync_sink_to_page_buffers(self):
+        if self.sink_len < self.sink_tokens:
+            return
+        if self.n_sink_pages <= 0:
+            return
+        sink_k_pages = self.sink_k[: self.eff_batch].transpose(1, 2).reshape(
+            self.eff_batch, self.n_sink_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        sink_v_pages = self.sink_v[: self.eff_batch].transpose(1, 2).reshape(
+            self.eff_batch, self.n_sink_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        for i in (0, 1):
+            if self.page_sink_ready[i]:
+                continue
+            pbuf = self.page_kv_buf[i]
+            if pbuf is None:
+                continue
+            pbuf[:, : self.n_sink_pages, 0].copy_(sink_k_pages, non_blocking=True)
+            pbuf[:, : self.n_sink_pages, 1].copy_(sink_v_pages, non_blocking=True)
+            self.page_sink_ready[i] = True
+
+    def _ensure_page_ids(self, bsz: int):
+        if self.local_pages <= 0:
+            self.page_ids = None
+            self.page_ids_bsz = bsz
+            return
+        if self.page_ids is not None and self.page_ids_bsz == bsz:
+            return
+        base = torch.arange(self.local_pages, dtype=torch.int32, device=self.device)
+        if self.eff_batch == 1 and bsz > 1:
+            self.page_ids = base.view(1, -1).expand(bsz, -1).contiguous()
+        else:
+            offs = (
+                torch.arange(bsz, dtype=torch.int32, device=self.device).view(-1, 1)
+                * int(self.local_pages)
+            )
+            self.page_ids = offs + base.view(1, -1)
+        self.page_ids_bsz = bsz
+
+    def _copy_window_pages_to_page_buffer(self, dst_pages: torch.Tensor):
+        win_len = self.win_len
+        if win_len < self.win_tokens or self.n_win_pages <= 0:
+            return
+        off = self.n_sink_pages + self.mid_pages
+        if self.win_ptr == 0:
+            win_tok = self.win_k[: self.eff_batch].transpose(1, 2)
+        else:
+            win_tok = torch.empty(
+                (self.eff_batch, self.win_tokens, self.n_kv_heads, self.head_dim),
+                dtype=self.win_k.dtype,
+                device=self.win_k.device,
+            )
+            tail = self.win_tokens - self.win_ptr
+            win_tok[:, :tail].copy_(
+                self.win_k[: self.eff_batch, :, self.win_ptr :].transpose(1, 2),
+                non_blocking=True,
+            )
+            win_tok[:, tail:].copy_(
+                self.win_k[: self.eff_batch, :, : self.win_ptr].transpose(1, 2),
+                non_blocking=True,
+            )
+        win_pages = win_tok.reshape(
+            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        dst_pages[:, off : off + self.n_win_pages, 0].copy_(win_pages, non_blocking=True)
+        if self.win_ptr == 0:
+            win_tok_v = self.win_v[: self.eff_batch].transpose(1, 2)
+        else:
+            win_tok_v = torch.empty_like(win_tok)
+            tail = self.win_tokens - self.win_ptr
+            win_tok_v[:, :tail].copy_(
+                self.win_v[: self.eff_batch, :, self.win_ptr :].transpose(1, 2),
+                non_blocking=True,
+            )
+            win_tok_v[:, tail:].copy_(
+                self.win_v[: self.eff_batch, :, : self.win_ptr].transpose(1, 2),
+                non_blocking=True,
+            )
+        win_pages_v = win_tok_v.reshape(
+            self.eff_batch, self.n_win_pages, self.page_size, self.n_kv_heads, self.head_dim
+        )
+        dst_pages[:, off : off + self.n_win_pages, 1].copy_(win_pages_v, non_blocking=True)
 
     def _get_head_index(self, device: torch.device):
         if self.anchor_head_sample <= 0 or self.anchor_head_sample >= self.n_kv_heads:
@@ -435,6 +546,7 @@ class EchoTokenPrefetchRuntime:
             return
         self.pending_idx = 1 - self.active_idx
         self.local_mid_ready[self.pending_idx] = False
+        self.page_mid_ready[self.pending_idx] = False
         out_buf = self.gpu_mid[self.pending_idx]
         if starts.dtype == torch.int32 and starts.device == self.device and starts.is_contiguous():
             starts_i32 = starts
@@ -465,6 +577,27 @@ class EchoTokenPrefetchRuntime:
                 local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
                 local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
                 self.local_mid_ready[self.pending_idx] = True
+            if self.page_kv_buf[self.pending_idx] is not None:
+                self._sync_sink_to_page_buffers()
+                pbuf = self.page_kv_buf[self.pending_idx]
+                mid_pages_k = out_buf[:, :, 0].view(
+                    self.eff_batch,
+                    self.mid_pages,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                )
+                mid_pages_v = out_buf[:, :, 1].view(
+                    self.eff_batch,
+                    self.mid_pages,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                )
+                offp = self.n_sink_pages
+                pbuf[:, offp : offp + self.mid_pages, 0].copy_(mid_pages_k, non_blocking=True)
+                pbuf[:, offp : offp + self.mid_pages, 1].copy_(mid_pages_v, non_blocking=True)
+                self.page_mid_ready[self.pending_idx] = True
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
@@ -479,6 +612,40 @@ class EchoTokenPrefetchRuntime:
         self.active_seq_len = self.pending_seq_len
         self.active_starts = self.pending_starts
         return True
+
+    def paged_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_page_ids(bsz)
+        pbuf = self.page_kv_buf[self.active_idx]
+        if pbuf is None:
+            raise RuntimeError("Echo page buffer is not initialized")
+        if not self.page_mid_ready[self.active_idx]:
+            mid = self.gpu_mid[self.active_idx]
+            mid_pages_k = mid[:, :, 0].view(
+                self.eff_batch, self.mid_pages, self.page_size, self.n_kv_heads, self.head_dim
+            )
+            mid_pages_v = mid[:, :, 1].view(
+                self.eff_batch, self.mid_pages, self.page_size, self.n_kv_heads, self.head_dim
+            )
+            offp = self.n_sink_pages
+            pbuf[:, offp : offp + self.mid_pages, 0].copy_(mid_pages_k, non_blocking=True)
+            pbuf[:, offp : offp + self.mid_pages, 1].copy_(mid_pages_v, non_blocking=True)
+            self.page_mid_ready[self.active_idx] = True
+        self._sync_sink_to_page_buffers()
+        self._copy_window_pages_to_page_buffer(pbuf)
+
+        if self.eff_batch == 1 and bsz > 1:
+            kv_data = pbuf[:1].reshape(
+                self.local_pages, 2, self.page_size, self.n_kv_heads, self.head_dim
+            )
+        else:
+            kv_data = pbuf.reshape(
+                self.eff_batch * self.local_pages,
+                2,
+                self.page_size,
+                self.n_kv_heads,
+                self.head_dim,
+            )
+        return kv_data, self.page_ids
 
     def current_middle_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
         mid = self.gpu_mid[self.active_idx]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]

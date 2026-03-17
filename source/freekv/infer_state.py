@@ -186,9 +186,11 @@ class InferState:
             kwargs.get("echo_use_cuda_token_recall", True)
         )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
+        self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "sdpa")).lower()
         self.profile_timing = bool(kwargs.get("profile_timing", True))
         assert self.echo_num_anchors > 0
         assert self.echo_anchor_head_sample >= 0
+        assert self.echo_attn_backend in ("sdpa", "flashinfer")
 
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
@@ -671,6 +673,7 @@ class InferState:
         # q: [bsz, 1, n_qo_heads, head_dim]
         rt = self.echo_runtimes[layer_idx]
         assert rt is not None
+        kvc = self.kv_caches[layer_idx]
         cur_seq = rt.cpu_len
         starts = rt.build_starts(cur_seq)
         if starts is not None and (
@@ -683,14 +686,23 @@ class InferState:
         ok = rt.activate_prefetch(cur_seq, self.compute_stream)
         if not ok:
             # Fallback: no sparse-ready region, use dense paged decode.
-            return self.decode_sdpa(layer_idx, q, self.kv_caches[layer_idx].c2p)
+            return self.decode_sdpa(layer_idx, q, kvc.c2p)
 
-        pack_t0 = self._perf_start("pack")
-        local_k, local_v, k_mid = rt.local_kv(q.shape[0])
-        self._perf_stop("pack", pack_t0)
-        attn_t0 = self._perf_start("attn")
-        out = rt.attend(q, local_k, local_v)
-        self._perf_stop("attn", attn_t0)
+        if self.echo_attn_backend == "flashinfer":
+            pack_t0 = self._perf_start("pack")
+            page_kv, page_ids = rt.paged_kv(q.shape[0])
+            self._perf_stop("pack", pack_t0)
+            attn_t0 = self._perf_start("attn")
+            out = self.decode_handler_tab[kvc.budget].forward(q, page_kv, page_ids)
+            self._perf_stop("attn", attn_t0)
+            k_mid, _ = rt.current_middle_kv(q.shape[0])
+        else:
+            pack_t0 = self._perf_start("pack")
+            local_k, local_v, k_mid = rt.local_kv(q.shape[0])
+            self._perf_stop("pack", pack_t0)
+            attn_t0 = self._perf_start("attn")
+            out = rt.attend(q, local_k, local_v)
+            self._perf_stop("attn", attn_t0)
 
         sel_t0 = self._perf_start("select")
         rt.update_anchors_from_middle(q, k_mid)
