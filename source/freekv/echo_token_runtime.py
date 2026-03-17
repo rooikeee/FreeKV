@@ -28,6 +28,7 @@ class EchoTokenPrefetchRuntime:
         seed_anchors: int = 64,
         shared_batch: bool = True,
         use_cuda_token_recall: bool = True,
+        anchor_head_sample: int = 0,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -40,7 +41,9 @@ class EchoTokenPrefetchRuntime:
         self.seed_anchors = int(max(1, seed_anchors))
         self.shared_batch = bool(shared_batch)
         self.use_cuda_token_recall = bool(use_cuda_token_recall)
+        self.anchor_head_sample = int(anchor_head_sample)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
+        self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
 
         self.sink_tokens = self.n_sink_pages * self.page_size
         self.win_tokens = self.n_win_pages * self.page_size
@@ -57,18 +60,19 @@ class EchoTokenPrefetchRuntime:
         self.cpu_len = 0
         self.cpu_kv = None  # [bsz, cap, 2, n_kv_heads, head_dim], pinned
 
-        self.sink_k = None  # [bsz, sink_tokens, n_kv_heads, head_dim]
+        self.sink_k = None  # [bsz, n_kv_heads, sink_tokens, head_dim]
         self.sink_v = None
-        self.win_k = None   # [bsz, win_tokens, n_kv_heads, head_dim]
+        self.win_k = None   # [bsz, n_kv_heads, win_tokens, head_dim]
         self.win_v = None
         self.sink_len = 0
         self.win_len = 0
         self.win_ptr = 0
 
-        self.local_k_buf = [None, None]
+        self.local_k_buf = [None, None]  # [eff, n_kv_heads, total, head_dim]
         self.local_v_buf = [None, None]
         self.local_mid_ready = [False, False]
         self.local_total_cap = self.sink_tokens + self.mid_tokens + self.win_tokens
+        self.local_sink_len_cached = [0, 0]
 
         self.gpu_mid = [None, None]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         self.pending_idx = 0
@@ -80,6 +84,7 @@ class EchoTokenPrefetchRuntime:
         self.prefetch_ready = False
 
         self.anchors = None  # [eff_bsz, mid_pages], token indices
+        self._head_idx = None
 
     def _effective_batch(self, bsz: int) -> int:
         if self.shared_batch and bsz > 1:
@@ -140,7 +145,7 @@ class EchoTokenPrefetchRuntime:
         self.gpu_mid[1] = torch.empty_like(self.gpu_mid[0])
         if self.local_total_cap > 0:
             self.local_k_buf[0] = torch.empty(
-                (eff_bsz, self.local_total_cap, self.n_kv_heads, self.head_dim),
+                (eff_bsz, self.n_kv_heads, self.local_total_cap, self.head_dim),
                 dtype=dtype,
                 device=device,
             )
@@ -170,6 +175,8 @@ class EchoTokenPrefetchRuntime:
         self.active_starts = None
         self.prefetch_ready = False
         self.local_mid_ready = [False, False]
+        self.local_sink_len_cached = [0, 0]
+        self._head_idx = None
 
     def _maybe_expand_cpu(self, needed_tokens: int):
         if needed_tokens <= self.cpu_capacity:
@@ -205,35 +212,41 @@ class EchoTokenPrefetchRuntime:
 
         if self.sink_tokens > 0:
             self.sink_k = torch.empty(
-                (self.batch_size, self.sink_tokens, self.n_kv_heads, self.head_dim),
+                (self.batch_size, self.n_kv_heads, self.sink_tokens, self.head_dim),
                 dtype=k.dtype,
                 device=k.device,
             )
             self.sink_v = torch.empty_like(self.sink_k)
             if self.sink_len > 0:
-                self.sink_k[:, : self.sink_len].copy_(k[:, : self.sink_len], non_blocking=True)
-                self.sink_v[:, : self.sink_len].copy_(v[:, : self.sink_len], non_blocking=True)
+                self.sink_k[:, :, : self.sink_len].copy_(
+                    k[:, : self.sink_len].transpose(1, 2), non_blocking=True
+                )
+                self.sink_v[:, :, : self.sink_len].copy_(
+                    v[:, : self.sink_len].transpose(1, 2), non_blocking=True
+                )
         else:
             self.sink_k = None
             self.sink_v = None
 
         if self.win_tokens > 0:
             self.win_k = torch.empty(
-                (self.batch_size, self.win_tokens, self.n_kv_heads, self.head_dim),
+                (self.batch_size, self.n_kv_heads, self.win_tokens, self.head_dim),
                 dtype=k.dtype,
                 device=k.device,
             )
             self.win_v = torch.empty_like(self.win_k)
             if self.win_len > 0:
-                self.win_k[:, : self.win_len].copy_(
-                    k[:, q_len - self.win_len : q_len], non_blocking=True
+                self.win_k[:, :, : self.win_len].copy_(
+                    k[:, q_len - self.win_len : q_len].transpose(1, 2), non_blocking=True
                 )
-                self.win_v[:, : self.win_len].copy_(
-                    v[:, q_len - self.win_len : q_len], non_blocking=True
+                self.win_v[:, :, : self.win_len].copy_(
+                    v[:, q_len - self.win_len : q_len].transpose(1, 2), non_blocking=True
                 )
         else:
             self.win_k = None
             self.win_v = None
+
+        self._sync_sink_to_local_buffers()
 
     def append_decode_token_to_cpu(
         self,
@@ -252,21 +265,24 @@ class EchoTokenPrefetchRuntime:
             self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 0].copy_(k_tok, non_blocking=True)
             self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 1].copy_(v_tok, non_blocking=True)
         self.cpu_len = needed
+        k_tok_h = k_tok.transpose(1, 2)
+        v_tok_h = v_tok.transpose(1, 2)
 
         if self.sink_tokens > 0:
             if self.sink_len < self.sink_tokens:
-                self.sink_k[:, self.sink_len : self.sink_len + 1].copy_(k_tok, non_blocking=True)
-                self.sink_v[:, self.sink_len : self.sink_len + 1].copy_(v_tok, non_blocking=True)
+                self.sink_k[:, :, self.sink_len : self.sink_len + 1].copy_(k_tok_h, non_blocking=True)
+                self.sink_v[:, :, self.sink_len : self.sink_len + 1].copy_(v_tok_h, non_blocking=True)
                 self.sink_len += 1
+                self._sync_sink_to_local_buffers()
 
         if self.win_tokens > 0:
             if self.win_len < self.win_tokens:
-                self.win_k[:, self.win_len : self.win_len + 1].copy_(k_tok, non_blocking=True)
-                self.win_v[:, self.win_len : self.win_len + 1].copy_(v_tok, non_blocking=True)
+                self.win_k[:, :, self.win_len : self.win_len + 1].copy_(k_tok_h, non_blocking=True)
+                self.win_v[:, :, self.win_len : self.win_len + 1].copy_(v_tok_h, non_blocking=True)
                 self.win_len += 1
             else:
-                self.win_k[:, self.win_ptr : self.win_ptr + 1].copy_(k_tok, non_blocking=True)
-                self.win_v[:, self.win_ptr : self.win_ptr + 1].copy_(v_tok, non_blocking=True)
+                self.win_k[:, :, self.win_ptr : self.win_ptr + 1].copy_(k_tok_h, non_blocking=True)
+                self.win_v[:, :, self.win_ptr : self.win_ptr + 1].copy_(v_tok_h, non_blocking=True)
                 self.win_ptr = (self.win_ptr + 1) % self.win_tokens
 
     def middle_bounds(self, seq_len: int) -> Optional[Tuple[int, int]]:
@@ -277,6 +293,42 @@ class EchoTokenPrefetchRuntime:
         if (upper - lower) < self.mid_tokens:
             return None
         return lower, upper
+
+    def _sync_sink_to_local_buffers(self):
+        if self.sink_len <= 0:
+            self.local_sink_len_cached = [0, 0]
+            return
+        for i in (0, 1):
+            lk = self.local_k_buf[i]
+            lv = self.local_v_buf[i]
+            if lk is None or lv is None:
+                continue
+            if self.local_sink_len_cached[i] == self.sink_len:
+                continue
+            lk[:, :, : self.sink_len].copy_(
+                self.sink_k[: self.eff_batch, :, : self.sink_len], non_blocking=True
+            )
+            lv[:, :, : self.sink_len].copy_(
+                self.sink_v[: self.eff_batch, :, : self.sink_len], non_blocking=True
+            )
+            self.local_sink_len_cached[i] = self.sink_len
+
+    def _get_head_index(self, device: torch.device):
+        if self.anchor_head_sample <= 0 or self.anchor_head_sample >= self.n_kv_heads:
+            return None
+        if self._head_idx is not None and self._head_idx.device == device:
+            return self._head_idx
+        k = int(max(1, min(self.anchor_head_sample, self.n_kv_heads)))
+        if k == 1:
+            idx = torch.zeros((1,), dtype=torch.long, device=device)
+        else:
+            idx = torch.floor(
+                torch.arange(k, device=device, dtype=torch.float32)
+                * (self.n_kv_heads / float(k))
+            ).to(torch.long)
+            idx = torch.clamp(idx, max=self.n_kv_heads - 1)
+        self._head_idx = idx.contiguous()
+        return self._head_idx
 
     def _expand_seed_anchors(self, anchors: torch.Tensor) -> torch.Tensor:
         # anchors: [eff_bsz, seed_k]
@@ -312,14 +364,20 @@ class EchoTokenPrefetchRuntime:
         eff_k = k_full[: self.eff_batch]
 
         grouped_q = eff_q.view(
-            self.eff_batch, 1, self.n_kv_heads, self.n_q_per_kv, self.head_dim
-        ).mean(dim=3).transpose(1, 2)  # [eff, n_kv_heads, 1, head_dim]
-        k_t = eff_k.transpose(1, 2).contiguous()  # [eff, n_kv_heads, seq_len, head_dim]
-        scores = torch.matmul(grouped_q, k_t.transpose(2, 3)) / math.sqrt(self.head_dim)
-        mid_scores = scores[:, :, 0, lower:upper]  # [eff, n_kv_heads, mid_len]
+            self.eff_batch, self.n_kv_heads, self.n_q_per_kv, self.head_dim
+        ).mean(dim=2)  # [eff, n_kv_heads, head_dim]
+        k_hsd = eff_k.transpose(1, 2).contiguous()  # [eff, n_kv_heads, seq_len, head_dim]
+        head_idx = self._get_head_index(grouped_q.device)
+        if head_idx is not None:
+            grouped_q = grouped_q.index_select(1, head_idx)
+            k_hsd = k_hsd.index_select(1, head_idx)
+        scores = torch.matmul(
+            grouped_q.unsqueeze(2), k_hsd.transpose(2, 3)
+        ).squeeze(2) * self._inv_sqrt_head_dim  # [eff, sampled_heads, seq_len]
+        mid_scores = scores[..., lower:upper]  # [eff, sampled_heads, mid_len]
         k = min(self.seed_anchors, mid_scores.shape[-1])
         seed = torch.topk(mid_scores, k=k, dim=-1).indices + lower
-        seed = seed.to(mid_scores.dtype).mean(dim=1).round().to(torch.long)  # [eff, k], shared over kv heads
+        seed = seed.to(mid_scores.dtype).mean(dim=1).round().to(torch.int32)  # [eff, k], shared over kv heads
         seed, _ = torch.sort(seed, dim=-1)
         anchors = self._expand_seed_anchors(seed)
         anchors, _ = torch.sort(anchors, dim=-1)
@@ -378,8 +436,10 @@ class EchoTokenPrefetchRuntime:
         self.pending_idx = 1 - self.active_idx
         self.local_mid_ready[self.pending_idx] = False
         out_buf = self.gpu_mid[self.pending_idx]
-        starts_i32 = starts.to(device=self.device, dtype=torch.int32).contiguous()
-        sink_len = self.sink_len
+        if starts.dtype == torch.int32 and starts.device == self.device and starts.is_contiguous():
+            starts_i32 = starts
+        else:
+            starts_i32 = starts.to(device=self.device, dtype=torch.int32).contiguous()
 
         with torch.cuda.stream(self.recall_stream):
             used_cuda = False
@@ -399,13 +459,11 @@ class EchoTokenPrefetchRuntime:
             if self.local_k_buf[self.pending_idx] is not None:
                 local_k = self.local_k_buf[self.pending_idx]
                 local_v = self.local_v_buf[self.pending_idx]
-                mid_k = out_buf[:, :, 0]
-                mid_v = out_buf[:, :, 1]
-                if sink_len > 0:
-                    local_k[:, :sink_len].copy_(self.sink_k[: self.eff_batch, :sink_len], non_blocking=True)
-                    local_v[:, :sink_len].copy_(self.sink_v[: self.eff_batch, :sink_len], non_blocking=True)
-                local_k[:, sink_len : sink_len + self.mid_tokens].copy_(mid_k, non_blocking=True)
-                local_v[:, sink_len : sink_len + self.mid_tokens].copy_(mid_v, non_blocking=True)
+                off = self.sink_len
+                mid_k_hsd = out_buf[:, :, 0].permute(0, 2, 1, 3)
+                mid_v_hsd = out_buf[:, :, 1].permute(0, 2, 1, 3)
+                local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
+                local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
                 self.local_mid_ready[self.pending_idx] = True
             self.prefetch_event.record(self.recall_stream)
 
@@ -426,8 +484,8 @@ class EchoTokenPrefetchRuntime:
         mid = self.gpu_mid[self.active_idx]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
         if self.eff_batch == 1 and bsz > 1:
             mid = mid[:1]
-        k_mid = mid[:, :, 0]
-        v_mid = mid[:, :, 1]
+        k_mid = mid[:, :, 0].permute(0, 2, 1, 3).contiguous()  # [eff, n_kv_heads, mid_tokens, head_dim]
+        v_mid = mid[:, :, 1].permute(0, 2, 1, 3).contiguous()
         return k_mid, v_mid
 
     def _copy_window_ordered(self, dst_k: torch.Tensor, dst_v: torch.Tensor, offset: int):
@@ -435,44 +493,41 @@ class EchoTokenPrefetchRuntime:
         if win_len <= 0:
             return
         if self.win_len < self.win_tokens or self.win_ptr == 0:
-            dst_k[:, offset : offset + win_len].copy_(
-                self.win_k[: self.eff_batch, :win_len], non_blocking=True
+            dst_k[:, :, offset : offset + win_len].copy_(
+                self.win_k[: self.eff_batch, :, :win_len], non_blocking=True
             )
-            dst_v[:, offset : offset + win_len].copy_(
-                self.win_v[: self.eff_batch, :win_len], non_blocking=True
+            dst_v[:, :, offset : offset + win_len].copy_(
+                self.win_v[: self.eff_batch, :, :win_len], non_blocking=True
             )
             return
         tail = self.win_tokens - self.win_ptr
-        dst_k[:, offset : offset + tail].copy_(
-            self.win_k[: self.eff_batch, self.win_ptr :], non_blocking=True
+        dst_k[:, :, offset : offset + tail].copy_(
+            self.win_k[: self.eff_batch, :, self.win_ptr :], non_blocking=True
         )
-        dst_v[:, offset : offset + tail].copy_(
-            self.win_v[: self.eff_batch, self.win_ptr :], non_blocking=True
+        dst_v[:, :, offset : offset + tail].copy_(
+            self.win_v[: self.eff_batch, :, self.win_ptr :], non_blocking=True
         )
-        dst_k[:, offset + tail : offset + self.win_tokens].copy_(
-            self.win_k[: self.eff_batch, : self.win_ptr], non_blocking=True
+        dst_k[:, :, offset + tail : offset + self.win_tokens].copy_(
+            self.win_k[: self.eff_batch, :, : self.win_ptr], non_blocking=True
         )
-        dst_v[:, offset + tail : offset + self.win_tokens].copy_(
-            self.win_v[: self.eff_batch, : self.win_ptr], non_blocking=True
+        dst_v[:, :, offset + tail : offset + self.win_tokens].copy_(
+            self.win_v[: self.eff_batch, :, : self.win_ptr], non_blocking=True
         )
 
     def local_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sink_len = self.sink_len
         win_len = self.win_len
         total = sink_len + self.mid_tokens + win_len
-        local_k = self.local_k_buf[self.active_idx][:, :total]
-        local_v = self.local_v_buf[self.active_idx][:, :total]
+        local_k = self.local_k_buf[self.active_idx][:, :, :total]
+        local_v = self.local_v_buf[self.active_idx][:, :, :total]
         if not self.local_mid_ready[self.active_idx]:
             k_mid, v_mid = self.current_middle_kv(bsz)
-            local_k[:, sink_len : sink_len + self.mid_tokens].copy_(k_mid, non_blocking=True)
-            local_v[:, sink_len : sink_len + self.mid_tokens].copy_(v_mid, non_blocking=True)
+            local_k[:, :, sink_len : sink_len + self.mid_tokens].copy_(k_mid, non_blocking=True)
+            local_v[:, :, sink_len : sink_len + self.mid_tokens].copy_(v_mid, non_blocking=True)
             self.local_mid_ready[self.active_idx] = True
-        if sink_len > 0:
-            local_k[:, :sink_len].copy_(self.sink_k[: self.eff_batch, :sink_len], non_blocking=True)
-            local_v[:, :sink_len].copy_(self.sink_v[: self.eff_batch, :sink_len], non_blocking=True)
         if win_len > 0:
             self._copy_window_ordered(local_k, local_v, sink_len + self.mid_tokens)
-        k_mid = local_k[:, sink_len : sink_len + self.mid_tokens]
+        k_mid = local_k[:, :, sink_len : sink_len + self.mid_tokens]
         if self.eff_batch == 1 and bsz > 1:
             return local_k[:1], local_v[:1], k_mid
         return local_k, local_v, k_mid
@@ -488,29 +543,34 @@ class EchoTokenPrefetchRuntime:
         starts = self.active_starts
 
         grouped_q = eff_q.view(
-            self.eff_batch, 1, self.n_kv_heads, self.n_q_per_kv, self.head_dim
-        ).mean(dim=3).transpose(1, 2)  # [eff, n_kv_heads, 1, head_dim]
-        km_t = eff_k_mid.transpose(1, 2).contiguous()  # [eff, n_kv_heads, mid_tokens, head_dim]
-        scores = torch.matmul(grouped_q, km_t.transpose(2, 3)) / math.sqrt(self.head_dim)
-        page_probs = scores[:, :, 0, :].view(
-            self.eff_batch, self.n_kv_heads, self.mid_pages, self.page_size
+            self.eff_batch, self.n_kv_heads, self.n_q_per_kv, self.head_dim
+        ).mean(dim=2)  # [eff, n_kv_heads, head_dim]
+        head_idx = self._get_head_index(grouped_q.device)
+        if head_idx is not None:
+            grouped_q = grouped_q.index_select(1, head_idx)
+            eff_k_mid = eff_k_mid.index_select(1, head_idx)
+        scores = torch.matmul(
+            grouped_q.unsqueeze(2), eff_k_mid.transpose(2, 3)
+        ).squeeze(2) * self._inv_sqrt_head_dim  # [eff, sampled_heads, mid_tokens]
+        page_probs = scores.view(
+            self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
         )
-        local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.long)
+        local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         anchors = starts + local_best
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors
 
     def attend(self, q: torch.Tensor, local_k: torch.Tensor, local_v: torch.Tensor) -> torch.Tensor:
         # q: [bsz, 1, n_qo_heads, head_dim]
-        # local_k/local_v: [bsz, s, n_kv_heads, head_dim]
+        # local_k/local_v: [bsz, n_kv_heads, s, head_dim]
         bsz = q.shape[0]
         if local_k.shape[0] != bsz:
             q_use = q[:1]
         else:
             q_use = q
         qh = q_use.transpose(1, 2).contiguous()        # [bsz, n_qo_heads, 1, head_dim]
-        kh = local_k.transpose(1, 2).contiguous()      # [bsz, n_kv_heads, s, head_dim]
-        vh = local_v.transpose(1, 2).contiguous()
+        kh = local_k
+        vh = local_v
 
         try:
             out = F.scaled_dot_product_attention(

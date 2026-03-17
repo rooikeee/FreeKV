@@ -92,6 +92,11 @@ def parse_args(args=None):
     parser.add_argument("--dataset", type=str, required=True, choices=["AIME24", "gov_report", "lgbench"], help="Evaluation dataset to use")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature (0 for greedy)")
     parser.add_argument("--max_length", type=int, default=32000, help="Max input token length (longer inputs are truncated from the middle)")
+    parser.add_argument(
+        "--expand_prompt_to_max_length",
+        action="store_true",
+        help="For prompts in (8192, max_length), repeat then trim to max_length (stress mode).",
+    )
     parser.add_argument("--max_gen", type=int, default=8192, help="Max number of new tokens to generate")
     parser.add_argument("--data_idx", type=int, default=None, help="Single data index to evaluate")
     parser.add_argument("--data_idx_to", type=int, default=None, help="Evaluate data from index 0 to this index (exclusive)")
@@ -113,6 +118,8 @@ def parse_args(args=None):
                         help="Selection policy")
     parser.add_argument("--echo_num_anchors", type=int, default=64,
                         help="Number of seed anchors for EchoKV-token")
+    parser.add_argument("--echo_anchor_head_sample", type=int, default=0,
+                        help="Sampled KV heads for anchor scoring (0=all heads)")
     parser.add_argument("--echo_shared_batch", dest="echo_shared_batch", action="store_true",
                         help="Use batch-0 shared anchors/recall for repeated batch decoding")
     parser.add_argument("--echo_no_shared_batch", dest="echo_shared_batch", action="store_false",
@@ -151,7 +158,7 @@ def load_model_and_tokenizer(path):
     print(f"  KV Cache Config: token_budget={token_budgets}, page_budget={page_budgets}, "
           f"page_size={page_size}, sink={args.sink}, recent={args.recent}")
     print(f"  Echo Config: sel_policy={args.sel_policy}, seed_anchors={args.echo_num_anchors}, "
-          f"shared_batch={args.echo_shared_batch}")
+          f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
         infer_state = adapter.enable_offload(
@@ -174,6 +181,7 @@ def load_model_and_tokenizer(path):
             corr=args.corr,
             sel_policy=args.sel_policy,
             echo_num_anchors=args.echo_num_anchors,
+            echo_anchor_head_sample=args.echo_anchor_head_sample,
             echo_shared_batch=args.echo_shared_batch,
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             profile_timing=(not args.disable_profile_timing),
@@ -207,6 +215,7 @@ def get_pred(
     model_name,
     temperature,
     warmup,
+    expand_prompt_to_max_length,
 ):
     preds = []
     for json_obj in tqdm(data):
@@ -217,8 +226,12 @@ def get_pred(
         tokenized_prompt = tokenizer(
             prompt, truncation=False, return_tensors="pt"
         ).input_ids[0]
-        if len(tokenized_prompt) > 8192 and len(tokenized_prompt) < max_length:
+        if expand_prompt_to_max_length and len(tokenized_prompt) > 8192 and len(tokenized_prompt) < max_length:
             # only for long inputs
+            print(
+                f"{YELLOW}[PromptExpand] input_len={len(tokenized_prompt)} in (8192, {max_length}), "
+                f"expanding to ~{max_length} for stress mode.{RESET}"
+            )
             tokenized_prompt = tokenized_prompt.repeat(max_length // len(tokenized_prompt) + 1)
             assert len(tokenized_prompt) > max_length
         if len(tokenized_prompt) > max_length:
@@ -337,6 +350,7 @@ if __name__ == "__main__":
         model_name,
         args.temperature,
         args.warmup,
+        args.expand_prompt_to_max_length,
     )
 
     out_dir = f"tmp_res/{model_name}"

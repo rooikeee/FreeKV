@@ -185,8 +185,10 @@ class InferState:
         self.echo_use_cuda_token_recall = bool(
             kwargs.get("echo_use_cuda_token_recall", True)
         )
+        self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.profile_timing = bool(kwargs.get("profile_timing", True))
         assert self.echo_num_anchors > 0
+        assert self.echo_anchor_head_sample >= 0
 
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
@@ -277,6 +279,7 @@ class InferState:
                     seed_anchors=self.echo_num_anchors,
                     shared_batch=self.echo_shared_batch,
                     use_cuda_token_recall=self.echo_use_cuda_token_recall,
+                    anchor_head_sample=self.echo_anchor_head_sample,
                 )
     
     def _shutdown_cpp_pool(self):
