@@ -882,11 +882,21 @@ class EchoTokenPrefetchRuntime:
     def build_starts(self, seq_len: int) -> Optional[torch.Tensor]:
         if self.mid_pages <= 0 or self.anchors is None:
             return None
+        anchors = self.anchors
+        if anchors.dim() == 3:
+            # Backward-compatible fix: collapse accidental [eff, heads, pages]
+            # anchors to the shared [eff, pages] layout used by recall.
+            anchors = anchors.to(torch.float32).mean(dim=1).round().to(torch.int32)
+            self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+        if anchors.dim() != 2:
+            raise RuntimeError(
+                f"EchoKV anchors must be 2D [eff_bsz, mid_pages], got shape={tuple(anchors.shape)}"
+            )
         bounds = self.middle_bounds(seq_len)
         if bounds is None:
             return None
         lower, upper = bounds
-        return self._tile_starts(self.anchors, lower, upper)
+        return self._tile_starts(anchors, lower, upper)
 
     def _fallback_recall(self, starts: torch.Tensor, out_buf: torch.Tensor):
         # starts: [eff_bsz, mid_pages], out_buf: [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
@@ -1203,10 +1213,10 @@ class EchoTokenPrefetchRuntime:
         if fused_out is None or qh_best is None:
             return self.attend(q, local_k, local_v), False
 
-        # q-head -> kv-head aggregation, keep same policy as previous mean+round.
+        # q-head aggregation to shared [eff, mid_pages] anchors.
         local_best = qh_best.view(
             fused_out.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
-        ).float().mean(dim=2).round().to(torch.int32)
+        ).float().mean(dim=(1, 2)).round().to(torch.int32)
         local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
         anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
