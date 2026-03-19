@@ -6,6 +6,353 @@ import torch.nn.functional as F
 
 from . import kernels
 
+try:
+    from flash_attn import flash_attn_func
+except Exception:
+    flash_attn_func = None
+
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    triton = None
+    tl = None
+
+
+def _next_pow2_cap(v: int, cap: int) -> int:
+    v = int(max(1, v))
+    out = 1
+    while out < v and out < cap:
+        out <<= 1
+    return int(min(out, cap))
+
+
+if triton is not None:
+    @triton.jit
+    def _echo_qk_page_argmax_kernel(
+        q_ptr,
+        mid_ptr,
+        out_ptr,
+        stride_q_b,
+        stride_q_h,
+        stride_q_d,
+        stride_m_b,
+        stride_m_t,
+        stride_m_h,
+        stride_m_d,
+        stride_o_b,
+        stride_o_h,
+        stride_o_p,
+        n_heads,
+        mid_pages,
+        head_dim,
+        BLOCK_T: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        pages_per_batch = n_heads * mid_pages
+        b = pid // pages_per_batch
+        rem = pid - b * pages_per_batch
+        h = rem // mid_pages
+        p = rem - h * mid_pages
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+        q_ptrs = q_ptr + b * stride_q_b + h * stride_q_h + offs_d * stride_q_d
+        q_vec = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+        offs_t = tl.arange(0, BLOCK_T)
+        best_score = -float("inf")
+        best_idx = 0
+        page_base = p * PAGE_SIZE
+
+        for t0 in tl.static_range(0, PAGE_SIZE, BLOCK_T):
+            tok = t0 + offs_t
+            mask_t = tok < PAGE_SIZE
+            mid_ptrs = (
+                mid_ptr
+                + b * stride_m_b
+                + (page_base + tok)[:, None] * stride_m_t
+                + h * stride_m_h
+                + offs_d[None, :] * stride_m_d
+            )
+            k_mat = tl.load(
+                mid_ptrs,
+                mask=mask_t[:, None] & mask_d[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            scores = tl.sum(k_mat * q_vec[None, :], axis=1)
+            scores = tl.where(mask_t, scores, -float("inf"))
+            blk_score = tl.max(scores, axis=0)
+            blk_idx = tl.argmax(scores, axis=0)
+            blk_idx = (t0 + blk_idx).to(tl.int32)
+            better = blk_score > best_score
+            best_score = tl.where(better, blk_score, best_score)
+            best_idx = tl.where(better, blk_idx, best_idx)
+
+        out_off = b * stride_o_b + h * stride_o_h + p * stride_o_p
+        tl.store(out_ptr + out_off, best_idx)
+
+
+if triton is not None:
+    @triton.jit
+    def _echo_flash_decode_fused_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        best_ptr,
+        stride_q_b,
+        stride_q_h,
+        stride_q_d,
+        stride_k_b,
+        stride_k_h,
+        stride_k_t,
+        stride_k_d,
+        stride_v_b,
+        stride_v_h,
+        stride_v_t,
+        stride_v_d,
+        stride_o_b,
+        stride_o_h,
+        stride_o_d,
+        stride_best_b,
+        stride_best_h,
+        stride_best_p,
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        scale,
+        BLOCK_D: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+        MAX_TOKENS: tl.constexpr,
+        MID_START: tl.constexpr,
+        MID_END: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        b = pid // n_q_heads
+        qh = pid - b * n_q_heads
+        kvh = qh // n_q_per_kv
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+        q_ptrs = q_ptr + b * stride_q_b + qh * stride_q_h + offs_d * stride_q_d
+        q_vec = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+        m_i = -float("inf")
+        l_i = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+        for n0 in tl.static_range(0, MAX_TOKENS, PAGE_SIZE):
+            offs_t = n0 + tl.arange(0, PAGE_SIZE)
+            mask_t = offs_t < seq_len
+
+            k_ptrs = (
+                k_ptr
+                + b * stride_k_b
+                + kvh * stride_k_h
+                + offs_t[:, None] * stride_k_t
+                + offs_d[None, :] * stride_k_d
+            )
+            v_ptrs = (
+                v_ptr
+                + b * stride_v_b
+                + kvh * stride_v_h
+                + offs_t[:, None] * stride_v_t
+                + offs_d[None, :] * stride_v_d
+            )
+            k_mat = tl.load(k_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0).to(
+                tl.float32
+            )
+            v_mat = tl.load(v_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0).to(
+                tl.float32
+            )
+
+            scores = tl.sum(k_mat * q_vec[None, :], axis=1) * scale
+            scores = tl.where(mask_t, scores, -float("inf"))
+
+            if n0 >= MID_START and n0 < MID_END:
+                page_idx = (n0 - MID_START) // PAGE_SIZE
+                best_local = tl.argmax(scores, axis=0).to(tl.int32)
+                b_ptr = (
+                    best_ptr
+                    + b * stride_best_b
+                    + qh * stride_best_h
+                    + page_idx * stride_best_p
+                )
+                tl.store(b_ptr, best_local)
+
+            m_ij = tl.max(scores, axis=0)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new)
+            l_i = l_i * alpha + tl.sum(p, axis=0)
+            acc = acc * alpha + tl.sum(p[:, None] * v_mat, axis=0)
+            m_i = m_new
+
+        out = acc / l_i
+        o_ptrs = o_ptr + b * stride_o_b + qh * stride_o_h + offs_d * stride_o_d
+        tl.store(o_ptrs, out, mask=mask_d)
+
+
+def _triton_qk_page_argmax(
+    grouped_q: torch.Tensor,
+    mid: torch.Tensor,
+    mid_pages: int,
+    page_size: int,
+) -> Optional[torch.Tensor]:
+    if triton is None:
+        return None
+    if grouped_q.device.type != "cuda" or mid.device.type != "cuda":
+        return None
+    if grouped_q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+    if mid.dtype != grouped_q.dtype:
+        return None
+    if page_size <= 0 or mid_pages <= 0:
+        return None
+    if mid.shape[1] != int(mid_pages * page_size):
+        return None
+
+    eff_bsz, sampled_heads, head_dim = grouped_q.shape
+    if head_dim > 256:
+        return None
+    out = torch.empty(
+        (eff_bsz, sampled_heads, mid_pages),
+        dtype=torch.int32,
+        device=grouped_q.device,
+    )
+    block_t = _next_pow2_cap(page_size, 128)
+    block_d = _next_pow2_cap(head_dim, 256)
+    num_warps = 4 if block_t <= 64 and block_d <= 128 else 8
+    grid = (eff_bsz * sampled_heads * mid_pages,)
+
+    _echo_qk_page_argmax_kernel[grid](
+        grouped_q,
+        mid,
+        out,
+        grouped_q.stride(0),
+        grouped_q.stride(1),
+        grouped_q.stride(2),
+        mid.stride(0),
+        mid.stride(1),
+        mid.stride(2),
+        mid.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        sampled_heads,
+        mid_pages,
+        head_dim,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
+        PAGE_SIZE=page_size,
+        num_warps=num_warps,
+    )
+    return out
+
+
+def _triton_flash_decode_attn_with_page_max(
+    q: torch.Tensor,            # [b, n_q_heads, d]
+    k: torch.Tensor,            # [b, n_kv_heads, s, d]
+    v: torch.Tensor,            # [b, n_kv_heads, s, d]
+    n_q_per_kv: int,
+    page_size: int,
+    mid_start: int,
+    mid_pages: int,
+    max_tokens: int,
+):
+    if triton is None:
+        return None, None
+    if q.device.type != "cuda" or k.device.type != "cuda" or v.device.type != "cuda":
+        return None, None
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None, None
+    if not (q.dtype == k.dtype == v.dtype):
+        return None, None
+    if q.dim() != 3 or k.dim() != 4 or v.dim() != 4:
+        return None, None
+
+    bsz, n_q_heads, head_dim = q.shape
+    if head_dim <= 0 or head_dim > 256:
+        return None, None
+    if n_q_per_kv <= 0 or (n_q_heads % n_q_per_kv) != 0:
+        return None, None
+    n_kv_heads = n_q_heads // n_q_per_kv
+    if k.shape[0] != bsz or v.shape[0] != bsz:
+        return None, None
+    if k.shape[1] != n_kv_heads or v.shape[1] != n_kv_heads:
+        return None, None
+    if k.shape[3] != head_dim or v.shape[3] != head_dim or k.shape[2] != v.shape[2]:
+        return None, None
+
+    seq_len = int(k.shape[2])
+    if seq_len <= 0:
+        return None, None
+    if max_tokens < seq_len:
+        return None, None
+    if page_size <= 0 or (max_tokens % page_size) != 0:
+        return None, None
+    mid_tokens = int(mid_pages * page_size)
+    mid_end = int(mid_start + mid_tokens)
+    if mid_pages <= 0 or mid_start < 0 or mid_end > seq_len:
+        return None, None
+    if (mid_start % page_size) != 0:
+        return None, None
+
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+
+    out = torch.empty_like(q_c)
+    best = torch.empty(
+        (bsz, n_q_heads, mid_pages),
+        dtype=torch.int32,
+        device=q.device,
+    )
+
+    block_d = _next_pow2_cap(head_dim, 256)
+    num_warps = 4 if block_d <= 128 else 8
+    grid = (bsz * n_q_heads,)
+    _echo_flash_decode_fused_kernel[grid](
+        q_c,
+        k_c,
+        v_c,
+        out,
+        best,
+        q_c.stride(0),
+        q_c.stride(1),
+        q_c.stride(2),
+        k_c.stride(0),
+        k_c.stride(1),
+        k_c.stride(2),
+        k_c.stride(3),
+        v_c.stride(0),
+        v_c.stride(1),
+        v_c.stride(2),
+        v_c.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        best.stride(0),
+        best.stride(1),
+        best.stride(2),
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        1.0 / math.sqrt(float(head_dim)),
+        BLOCK_D=block_d,
+        PAGE_SIZE=page_size,
+        MAX_TOKENS=max_tokens,
+        MID_START=mid_start,
+        MID_END=mid_end,
+        num_warps=num_warps,
+    )
+    return out, best
+
 
 class EchoTokenPrefetchRuntime:
     """
@@ -29,6 +376,8 @@ class EchoTokenPrefetchRuntime:
         shared_batch: bool = True,
         use_cuda_token_recall: bool = True,
         anchor_head_sample: int = 0,
+        use_triton_qk_select: bool = True,
+        use_triton_flash_attn: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -42,6 +391,8 @@ class EchoTokenPrefetchRuntime:
         self.shared_batch = bool(shared_batch)
         self.use_cuda_token_recall = bool(use_cuda_token_recall)
         self.anchor_head_sample = int(anchor_head_sample)
+        self.use_triton_qk_select = bool(use_triton_qk_select and (triton is not None))
+        self.use_triton_flash_attn = bool(use_triton_flash_attn and (triton is not None))
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -583,7 +934,12 @@ class EchoTokenPrefetchRuntime:
                 )
         return True
 
-    def launch_prefetch(self, starts: torch.Tensor, target_seq_len: int):
+    def launch_prefetch(
+        self,
+        starts: torch.Tensor,
+        target_seq_len: int,
+        allow_inplace_delta: bool = True,
+    ):
         # starts: [eff_bsz, mid_pages]
         if self.mid_pages <= 0 or starts is None:
             self.prefetch_ready = False
@@ -598,7 +954,7 @@ class EchoTokenPrefetchRuntime:
 
         with torch.cuda.stream(self.recall_stream):
             used_delta = False
-            if self.active_starts is not None:
+            if allow_inplace_delta and self.active_starts is not None:
                 # In-place delta patch on active buffer avoids large D2D copy.
                 used_delta = self._delta_recall_from_active(
                     starts_cpu, self.gpu_mid[self.active_idx], in_place=True
@@ -757,13 +1113,24 @@ class EchoTokenPrefetchRuntime:
         if head_idx is not None:
             grouped_q = grouped_q.index_select(1, head_idx)
             eff_k_mid = eff_k_mid.index_select(1, head_idx)
-        scores = torch.matmul(
-            grouped_q.unsqueeze(2), eff_k_mid.transpose(2, 3)
-        ).squeeze(2) * self._inv_sqrt_head_dim  # [eff, sampled_heads, mid_tokens]
-        page_probs = scores.view(
-            self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
-        )
-        local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
+        local_best = None
+        if self.use_triton_qk_select:
+            tri_out = _triton_qk_page_argmax(
+                grouped_q,
+                eff_k_mid.transpose(1, 2).contiguous(),
+                self.mid_pages,
+                self.page_size,
+            )
+            if tri_out is not None:
+                local_best = tri_out.float().mean(dim=1).round().to(torch.int32)
+        if local_best is None:
+            scores = torch.matmul(
+                grouped_q.unsqueeze(2), eff_k_mid.transpose(2, 3)
+            ).squeeze(2) * self._inv_sqrt_head_dim  # [eff, sampled_heads, mid_tokens]
+            page_probs = scores.view(
+                self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
+            )
+            local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         anchors = starts + local_best
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
@@ -783,16 +1150,72 @@ class EchoTokenPrefetchRuntime:
         if head_idx is not None:
             grouped_q = grouped_q.index_select(1, head_idx)
             mid = mid.index_select(2, head_idx)
-        # [eff, sampled_heads, mid_tokens]
-        scores = torch.einsum("ehd,ethd->eht", grouped_q, mid) * self._inv_sqrt_head_dim
-        page_probs = scores.view(
-            self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
-        )
-        local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
+        local_best = None
+        if self.use_triton_qk_select:
+            tri_out = _triton_qk_page_argmax(
+                grouped_q,
+                mid,
+                self.mid_pages,
+                self.page_size,
+            )
+            if tri_out is not None:
+                local_best = tri_out.float().mean(dim=1).round().to(torch.int32)
+        if local_best is None:
+            # [eff, sampled_heads, mid_tokens]
+            scores = torch.einsum("ehd,ethd->eht", grouped_q, mid) * self._inv_sqrt_head_dim
+            page_probs = scores.view(
+                self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
+            )
+            local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
         anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
+
+    def attend_and_update_anchors_fused(
+        self,
+        q: torch.Tensor,         # [bsz, 1, n_qo_heads, head_dim]
+        local_k: torch.Tensor,   # [eff/bsz, n_kv_heads, s, head_dim]
+        local_v: torch.Tensor,   # [eff/bsz, n_kv_heads, s, head_dim]
+    ) -> Tuple[torch.Tensor, bool]:
+        if (not self.use_triton_flash_attn) or self.mid_pages <= 0:
+            return self.attend(q, local_k, local_v), False
+        if self.active_starts is None:
+            return self.attend(q, local_k, local_v), False
+
+        bsz = q.shape[0]
+        if local_k.shape[0] != bsz:
+            q_use = q[:1]
+        else:
+            q_use = q
+        q_compact = q_use[:, 0].contiguous()  # [eff, n_qo_heads, head_dim]
+
+        fused_out, qh_best = _triton_flash_decode_attn_with_page_max(
+            q_compact,
+            local_k,
+            local_v,
+            n_q_per_kv=self.n_q_per_kv,
+            page_size=self.page_size,
+            mid_start=self.sink_len,
+            mid_pages=self.mid_pages,
+            max_tokens=self.local_total_cap,
+        )
+        if fused_out is None or qh_best is None:
+            return self.attend(q, local_k, local_v), False
+
+        # q-head -> kv-head aggregation, keep same policy as previous mean+round.
+        local_best = qh_best.view(
+            fused_out.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
+        ).float().mean(dim=2).round().to(torch.int32)
+        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
+        anchors = self.active_starts + local_best_cpu
+        anchors, _ = torch.sort(anchors, dim=-1)
+        self.anchors = anchors.to(dtype=torch.int32).contiguous()
+
+        out = fused_out.unsqueeze(1).contiguous()  # [eff, 1, n_qo_heads, head_dim]
+        if out.shape[0] == 1 and bsz > 1:
+            out = out.expand(bsz, -1, -1, -1).contiguous()
+        return out, True
 
     def attend(self, q: torch.Tensor, local_k: torch.Tensor, local_v: torch.Tensor) -> torch.Tensor:
         # q: [bsz, 1, n_qo_heads, head_dim]
@@ -823,6 +1246,47 @@ class EchoTokenPrefetchRuntime:
                 qh, kh, vh, attn_mask=None, dropout_p=0.0, is_causal=False
             )
         out = out.transpose(1, 2).contiguous()  # [bsz, 1, n_qo_heads, head_dim]
+        if out.shape[0] == 1 and bsz > 1:
+            out = out.expand(bsz, -1, -1, -1).contiguous()
+        return out
+
+    def attend_flash_attn(
+        self,
+        q: torch.Tensor,
+        local_k: torch.Tensor,
+        local_v: torch.Tensor,
+        strict: bool = False,
+    ) -> torch.Tensor:
+        # q: [bsz, 1, n_qo_heads, head_dim]
+        # local_k/local_v: [bsz, n_kv_heads, s, head_dim]
+        if flash_attn_func is None:
+            if strict:
+                raise RuntimeError(
+                    "echo_attn_backend=flash_attn requested, but flash_attn is not installed."
+                )
+            return self.attend(q, local_k, local_v)
+
+        bsz = q.shape[0]
+        if local_k.shape[0] != bsz:
+            q_use = q[:1]
+        else:
+            q_use = q
+
+        q_in = q_use.contiguous()  # [eff, 1, n_q_heads, d]
+        k_in = local_k.transpose(1, 2).contiguous()  # [eff, s, n_kv_heads, d]
+        v_in = local_v.transpose(1, 2).contiguous()
+        if self.n_q_per_kv > 1:
+            k_in = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
+            v_in = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
+
+        out = flash_attn_func(
+            q_in,
+            k_in,
+            v_in,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=False,
+        )
         if out.shape[0] == 1 and bsz > 1:
             out = out.expand(bsz, -1, -1, -1).contiguous()
         return out

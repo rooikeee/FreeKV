@@ -186,12 +186,18 @@ class InferState:
         self.echo_use_cuda_token_recall = bool(
             kwargs.get("echo_use_cuda_token_recall", True)
         )
+        self.echo_use_triton_qk_select = bool(
+            kwargs.get("echo_use_triton_qk_select", True)
+        )
+        self.echo_use_triton_flash_attn = bool(
+            kwargs.get("echo_use_triton_flash_attn", True)
+        )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "sdpa")).lower()
         self.profile_timing = bool(kwargs.get("profile_timing", True))
         assert self.echo_num_anchors > 0
         assert self.echo_anchor_head_sample >= 0
-        assert self.echo_attn_backend in ("sdpa", "flashinfer")
+        assert self.echo_attn_backend in ("sdpa", "flashinfer", "flash_attn")
 
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
@@ -283,6 +289,8 @@ class InferState:
                     shared_batch=self.echo_shared_batch,
                     use_cuda_token_recall=self.echo_use_cuda_token_recall,
                     anchor_head_sample=self.echo_anchor_head_sample,
+                    use_triton_qk_select=self.echo_use_triton_qk_select,
+                    use_triton_flash_attn=self.echo_use_triton_flash_attn,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -719,6 +727,21 @@ class InferState:
             return self.decode_sdpa(layer_idx, q, kvc.c2p)
 
         if self.echo_attn_backend == "flashinfer":
+            # FlashInfer path keeps the separate QK selector.
+            sel_t0 = self._perf_start("select")
+            rt.update_anchors_from_active_mid(q)
+            self._perf_stop("select", sel_t0)
+
+            next_starts = rt.build_starts(cur_seq + 1)
+            if next_starts is not None:
+                rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                rt.launch_prefetch(
+                    next_starts,
+                    target_seq_len=cur_seq + 1,
+                    allow_inplace_delta=False,
+                )
+                self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+
             pack_t0 = self._perf_start("pack")
             page_kv, page_ids = rt.paged_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)
@@ -729,26 +752,55 @@ class InferState:
             else:
                 out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
+        elif self.echo_attn_backend == "flash_attn":
+            # Flash-Attn backend with Triton-fused attention+anchor update preference.
+            pack_t0 = self._perf_start("pack")
+            local_k, local_v, k_mid = rt.local_kv(q.shape[0])
+            self._perf_stop("pack", pack_t0)
+
+            attn_t0 = self._perf_start("attn")
+            out, fused_select = rt.attend_and_update_anchors_fused(q, local_k, local_v)
+            if not fused_select:
+                out = rt.attend_flash_attn(q, local_k, local_v, strict=True)
+            self._perf_stop("attn", attn_t0)
+
+            if not fused_select:
+                sel_t0 = self._perf_start("select")
+                rt.update_anchors_from_middle(q, k_mid)
+                self._perf_stop("select", sel_t0)
+
+            next_starts = rt.build_starts(cur_seq + 1)
+            if next_starts is not None:
+                rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                rt.launch_prefetch(
+                    next_starts,
+                    target_seq_len=cur_seq + 1,
+                    allow_inplace_delta=False,
+                )
+                self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
         else:
             pack_t0 = self._perf_start("pack")
             local_k, local_v, k_mid = rt.local_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)
+
             attn_t0 = self._perf_start("attn")
-            out = rt.attend(q, local_k, local_v)
+            out, fused_select = rt.attend_and_update_anchors_fused(q, local_k, local_v)
             self._perf_stop("attn", attn_t0)
 
-        sel_t0 = self._perf_start("select")
-        if self.echo_attn_backend == "flashinfer":
-            rt.update_anchors_from_active_mid(q)
-        else:
-            rt.update_anchors_from_middle(q, k_mid)
-        self._perf_stop("select", sel_t0)
+            if not fused_select:
+                sel_t0 = self._perf_start("select")
+                rt.update_anchors_from_middle(q, k_mid)
+                self._perf_stop("select", sel_t0)
 
-        next_starts = rt.build_starts(cur_seq + 1)
-        if next_starts is not None:
-            rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
-            rt.launch_prefetch(next_starts, target_seq_len=cur_seq + 1)
-            self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+            next_starts = rt.build_starts(cur_seq + 1)
+            if next_starts is not None:
+                rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                rt.launch_prefetch(
+                    next_starts,
+                    target_seq_len=cur_seq + 1,
+                    allow_inplace_delta=False,
+                )
+                self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
         return out
 
     def recall(self, layer_idx: int, 
