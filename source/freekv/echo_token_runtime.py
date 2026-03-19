@@ -1648,18 +1648,30 @@ class EchoTokenPrefetchRuntime:
         q_in = q_use.contiguous()  # [eff, 1, n_q_heads, d]
         k_in = local_k.transpose(1, 2).contiguous()  # [eff, s, n_kv_heads, d]
         v_in = local_v.transpose(1, 2).contiguous()
-        if self.n_q_per_kv > 1:
-            k_in = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
-            v_in = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
 
-        out = flash_attn_func(
-            q_in,
-            k_in,
-            v_in,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=False,
-        )
+        try:
+            # Prefer native GQA path to avoid per-step key/value head expansion.
+            out = flash_attn_func(
+                q_in,
+                k_in,
+                v_in,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=False,
+            )
+        except Exception:
+            if self.n_q_per_kv <= 1:
+                raise
+            k_rep = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
+            v_rep = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
+            out = flash_attn_func(
+                q_in,
+                k_rep,
+                v_rep,
+                dropout_p=0.0,
+                softmax_scale=None,
+                causal=False,
+            )
         if out.shape[0] == 1 and bsz > 1:
             out = out.expand(bsz, -1, -1, -1).contiguous()
         return out

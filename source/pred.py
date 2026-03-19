@@ -134,6 +134,8 @@ def parse_args(args=None):
                         help="Disable Triton QK page-argmax selector for EchoKV-token")
     parser.add_argument("--echo_disable_triton_flash_attn", action="store_true",
                         help="Disable Triton fused decode-attention(+anchor) for EchoKV-token")
+    parser.add_argument("--echo_allow_flash_fallback", action="store_true",
+                        help="Allow fallback when Triton flash path is unavailable")
     parser.add_argument("--disable_profile_timing", action="store_true",
                         help="Disable CUDA event timing for select/recall/attn")
     parser.add_argument("--warmup", type=int, default=2, help="Number of warmup generation rounds before timing")
@@ -168,7 +170,8 @@ def load_model_and_tokenizer(path):
           f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}, "
           f"attn_backend={args.echo_attn_backend}, "
           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
-          f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}")
+          f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
+          f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
         infer_state = adapter.enable_offload(
@@ -197,6 +200,7 @@ def load_model_and_tokenizer(path):
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             echo_use_triton_qk_select=(not args.echo_disable_triton_qk_select),
             echo_use_triton_flash_attn=(not args.echo_disable_triton_flash_attn),
+            echo_require_triton_flash=(not args.echo_allow_flash_fallback),
             profile_timing=(not args.disable_profile_timing),
         )
     else:
