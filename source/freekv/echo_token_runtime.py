@@ -199,6 +199,90 @@ if triton is not None:
 
 if triton is not None:
     @triton.jit
+    def _echo_flash_decode_plain_kernel(
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        o_ptr,
+        stride_q_b,
+        stride_q_h,
+        stride_q_d,
+        stride_k_b,
+        stride_k_h,
+        stride_k_t,
+        stride_k_d,
+        stride_v_b,
+        stride_v_h,
+        stride_v_t,
+        stride_v_d,
+        stride_o_b,
+        stride_o_h,
+        stride_o_d,
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        scale,
+        BLOCK_D: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        MAX_TOKENS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        b = pid // n_q_heads
+        qh = pid - b * n_q_heads
+        kvh = qh // n_q_per_kv
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+        q_ptrs = q_ptr + b * stride_q_b + qh * stride_q_h + offs_d * stride_q_d
+        q_vec = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+        m_i = -float("inf")
+        l_i = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+        for n0 in tl.static_range(0, MAX_TOKENS, BLOCK_N):
+            offs_n = n0 + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < seq_len
+            k_ptrs = (
+                k_ptr
+                + b * stride_k_b
+                + kvh * stride_k_h
+                + offs_n[:, None] * stride_k_t
+                + offs_d[None, :] * stride_k_d
+            )
+            v_ptrs = (
+                v_ptr
+                + b * stride_v_b
+                + kvh * stride_v_h
+                + offs_n[:, None] * stride_v_t
+                + offs_d[None, :] * stride_v_d
+            )
+            k_mat = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(
+                tl.float32
+            )
+            v_mat = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0).to(
+                tl.float32
+            )
+
+            scores = tl.sum(k_mat * q_vec[None, :], axis=1) * scale
+            scores = tl.where(mask_n, scores, -float("inf"))
+
+            m_ij = tl.max(scores, axis=0)
+            m_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new)
+            l_i = l_i * alpha + tl.sum(p, axis=0)
+            acc = acc * alpha + tl.sum(p[:, None] * v_mat, axis=0)
+            m_i = m_new
+
+        out = acc / l_i
+        o_ptrs = o_ptr + b * stride_o_b + qh * stride_o_h + offs_d * stride_o_d
+        tl.store(o_ptrs, out, mask=mask_d)
+
+
+if triton is not None:
+    @triton.jit
     def _echo_flash_decode_qk_select_kernel(
         q_ptr,
         k_ptr,
@@ -655,6 +739,87 @@ def _triton_flash_decode_pv_from_scores(
         num_warps=num_warps,
     )
     return out.to(dtype=v.dtype)
+
+
+def _triton_flash_decode_attn_plain(
+    q: torch.Tensor,            # [b, n_q_heads, d]
+    k: torch.Tensor,            # [b, n_kv_heads, s, d]
+    v: torch.Tensor,            # [b, n_kv_heads, s, d]
+    n_q_per_kv: int,
+    max_tokens: int,
+):
+    if triton is None:
+        return None
+    if q.device.type != "cuda" or k.device.type != "cuda" or v.device.type != "cuda":
+        return None
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+    if not (q.dtype == k.dtype == v.dtype):
+        return None
+    if q.dim() != 3 or k.dim() != 4 or v.dim() != 4:
+        return None
+
+    bsz, n_q_heads, head_dim = q.shape
+    if head_dim <= 0 or head_dim > 256:
+        return None
+    if n_q_per_kv <= 0 or (n_q_heads % n_q_per_kv) != 0:
+        return None
+    n_kv_heads = n_q_heads // n_q_per_kv
+    if k.shape[0] != bsz or v.shape[0] != bsz:
+        return None
+    if k.shape[1] != n_kv_heads or v.shape[1] != n_kv_heads:
+        return None
+    if k.shape[3] != head_dim or v.shape[3] != head_dim:
+        return None
+    if k.shape[2] != v.shape[2]:
+        return None
+
+    seq_len = int(k.shape[2])
+    if seq_len <= 0 or max_tokens < seq_len:
+        return None
+
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    v_c = v.contiguous()
+    out = torch.empty_like(q_c)
+
+    block_d = _next_pow2_cap(head_dim, 256)
+    block_n = 128 if max_tokens >= 128 else 64
+    if block_n > max_tokens:
+        block_n = _next_pow2_cap(max_tokens, 128)
+    num_warps = 4 if block_d <= 128 else 8
+    grid = (bsz * n_q_heads,)
+
+    _echo_flash_decode_plain_kernel[grid](
+        q_c,
+        k_c,
+        v_c,
+        out,
+        q_c.stride(0),
+        q_c.stride(1),
+        q_c.stride(2),
+        k_c.stride(0),
+        k_c.stride(1),
+        k_c.stride(2),
+        k_c.stride(3),
+        v_c.stride(0),
+        v_c.stride(1),
+        v_c.stride(2),
+        v_c.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        1.0 / math.sqrt(float(head_dim)),
+        BLOCK_D=block_d,
+        BLOCK_N=block_n,
+        MAX_TOKENS=max_tokens,
+        num_warps=num_warps,
+    )
+    return out
 
 
 class EchoTokenPrefetchRuntime:
@@ -1632,46 +1797,59 @@ class EchoTokenPrefetchRuntime:
     ) -> torch.Tensor:
         # q: [bsz, 1, n_qo_heads, head_dim]
         # local_k/local_v: [bsz, n_kv_heads, s, head_dim]
-        if flash_attn_func is None:
-            if strict:
-                raise RuntimeError(
-                    "echo_attn_backend=flash_attn requested, but flash_attn is not installed."
-                )
-            return self.attend(q, local_k, local_v)
-
         bsz = q.shape[0]
         if local_k.shape[0] != bsz:
             q_use = q[:1]
         else:
             q_use = q
 
-        q_in = q_use.contiguous()  # [eff, 1, n_q_heads, d]
-        k_in = local_k.transpose(1, 2).contiguous()  # [eff, s, n_kv_heads, d]
-        v_in = local_v.transpose(1, 2).contiguous()
+        out_compact = None
+        if self.use_triton_flash_attn:
+            q_compact = q_use[:, 0].contiguous()  # [eff, n_q_heads, d]
+            out_compact = _triton_flash_decode_attn_plain(
+                q_compact,
+                local_k,
+                local_v,
+                n_q_per_kv=self.n_q_per_kv,
+                max_tokens=self.local_total_cap,
+            )
+        if out_compact is not None:
+            out = out_compact.unsqueeze(1).contiguous()
+        else:
+            if flash_attn_func is None:
+                if strict:
+                    raise RuntimeError(
+                        "echo_attn_backend=flash_attn requested, but Triton plain flash-attn "
+                        "kernel is unavailable and flash_attn package is not installed."
+                    )
+                return self.attend(q, local_k, local_v)
 
-        try:
-            # Prefer native GQA path to avoid per-step key/value head expansion.
-            out = flash_attn_func(
-                q_in,
-                k_in,
-                v_in,
-                dropout_p=0.0,
-                softmax_scale=None,
-                causal=False,
-            )
-        except Exception:
-            if self.n_q_per_kv <= 1:
-                raise
-            k_rep = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
-            v_rep = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
-            out = flash_attn_func(
-                q_in,
-                k_rep,
-                v_rep,
-                dropout_p=0.0,
-                softmax_scale=None,
-                causal=False,
-            )
+            q_in = q_use.contiguous()  # [eff, 1, n_q_heads, d]
+            k_in = local_k.transpose(1, 2).contiguous()  # [eff, s, n_kv_heads, d]
+            v_in = local_v.transpose(1, 2).contiguous()
+            try:
+                # Prefer native GQA path to avoid per-step key/value head expansion.
+                out = flash_attn_func(
+                    q_in,
+                    k_in,
+                    v_in,
+                    dropout_p=0.0,
+                    softmax_scale=None,
+                    causal=False,
+                )
+            except Exception:
+                if self.n_q_per_kv <= 1:
+                    raise
+                k_rep = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
+                v_rep = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
+                out = flash_attn_func(
+                    q_in,
+                    k_rep,
+                    v_rep,
+                    dropout_p=0.0,
+                    softmax_scale=None,
+                    causal=False,
+                )
         if out.shape[0] == 1 and bsz > 1:
             out = out.expand(bsz, -1, -1, -1).contiguous()
         return out

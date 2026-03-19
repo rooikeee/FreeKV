@@ -756,28 +756,15 @@ class InferState:
                 out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
         elif self.echo_attn_backend == "flash_attn":
-            # Triton "modified flash-attn" path:
-            # stage-1: QK + page argmax anchor (no-loss selection)
-            # stage-2: launch next recall immediately
-            # stage-3: P@V from cached QK scores
+            # Plain Triton flash-attn path (no kernel-level EchoKV fusion).
+            # Keep selector/recall outside attention kernel for baseline speed validation.
             pack_t0 = self._perf_start("pack")
             local_k, local_v, _ = rt.local_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)
 
             sel_t0 = self._perf_start("select")
-            score_cache = rt.qk_select_and_cache_scores(q, local_k)
+            rt.update_anchors_from_active_mid(q)
             self._perf_stop("select", sel_t0)
-
-            if score_cache is None:
-                if self.echo_require_triton_flash:
-                    raise RuntimeError(
-                        "echo_attn_backend=flash_attn requires Triton QK-select kernel, "
-                        "but stage-1 returned None."
-                    )
-                # Triton stage-1 unavailable: fallback selector.
-                sel_fb_t0 = self._perf_start("select")
-                rt.update_anchors_from_active_mid(q)
-                self._perf_stop("select", sel_fb_t0)
 
             next_starts = rt.build_starts(cur_seq + 1)
             if next_starts is not None:
@@ -790,15 +777,12 @@ class InferState:
                 self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
             attn_t0 = self._perf_start("attn")
-            out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
-            if out is None:
-                if self.echo_require_triton_flash:
-                    raise RuntimeError(
-                        "echo_attn_backend=flash_attn requires Triton P@V kernel, "
-                        "but stage-2 returned None."
-                    )
-                # Triton stage-2 unavailable: fallback to baseline attention.
-                out = rt.attend(q, local_k, local_v)
+            out = rt.attend_flash_attn(
+                q,
+                local_k,
+                local_v,
+                strict=self.echo_require_triton_flash,
+            )
             self._perf_stop("attn", attn_t0)
         else:
             pack_t0 = self._perf_start("pack")
