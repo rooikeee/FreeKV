@@ -741,7 +741,7 @@ class InferState:
                 rt.launch_prefetch(
                     next_starts,
                     target_seq_len=cur_seq + 1,
-                    allow_inplace_delta=False,
+                    allow_inplace_delta=True,
                 )
                 self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
@@ -756,15 +756,26 @@ class InferState:
                 out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
         elif self.echo_attn_backend == "flash_attn":
-            # Plain Triton flash-attn path (no kernel-level EchoKV fusion).
-            # Keep selector/recall outside attention kernel for baseline speed validation.
+            # Modified Triton flash-attn path:
+            # stage-1: QK + page-argmax anchors
+            # stage-2: launch next recall immediately
+            # stage-3: P@V from stage-1 score cache
             pack_t0 = self._perf_start("pack")
             local_k, local_v, _ = rt.local_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)
 
             sel_t0 = self._perf_start("select")
-            rt.update_anchors_from_active_mid(q)
+            score_cache = rt.qk_select_and_cache_scores(q, local_k)
             self._perf_stop("select", sel_t0)
+            if score_cache is None:
+                if self.echo_require_triton_flash:
+                    raise RuntimeError(
+                        "echo_attn_backend=flash_attn requires Triton QK-select stage, "
+                        "but stage-1 returned None."
+                    )
+                sel_fb_t0 = self._perf_start("select")
+                rt.update_anchors_from_active_mid(q)
+                self._perf_stop("select", sel_fb_t0)
 
             next_starts = rt.build_starts(cur_seq + 1)
             if next_starts is not None:
@@ -772,17 +783,24 @@ class InferState:
                 rt.launch_prefetch(
                     next_starts,
                     target_seq_len=cur_seq + 1,
-                    allow_inplace_delta=False,
+                    allow_inplace_delta=True,
                 )
                 self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
             attn_t0 = self._perf_start("attn")
-            out = rt.attend_flash_attn(
-                q,
-                local_k,
-                local_v,
-                strict=self.echo_require_triton_flash,
-            )
+            out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
+            if out is None:
+                if self.echo_require_triton_flash:
+                    raise RuntimeError(
+                        "echo_attn_backend=flash_attn requires Triton P@V stage, "
+                        "but stage-2 returned None."
+                    )
+                out = rt.attend_flash_attn(
+                    q,
+                    local_k,
+                    local_v,
+                    strict=False,
+                )
             self._perf_stop("attn", attn_t0)
         else:
             pack_t0 = self._perf_start("pack")
@@ -804,7 +822,7 @@ class InferState:
                 rt.launch_prefetch(
                     next_starts,
                     target_seq_len=cur_seq + 1,
-                    allow_inplace_delta=False,
+                    allow_inplace_delta=True,
                 )
                 self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
         return out

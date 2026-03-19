@@ -1432,14 +1432,34 @@ class EchoTokenPrefetchRuntime:
 
         with torch.cuda.stream(self.recall_stream):
             used_delta = False
-            if allow_inplace_delta and self.active_starts is not None:
-                # In-place delta patch on active buffer avoids large D2D copy.
+            if (
+                allow_inplace_delta
+                and self.active_starts is not None
+                and self.use_cuda_token_recall
+                and hasattr(kernels, "recall_tokens_delta_linear")
+            ):
+                try:
+                    kernels.recall_tokens_delta_linear(
+                        starts_i32,
+                        self.active_starts,
+                        self.cpu_kv[: self.eff_batch],
+                        self.gpu_mid[self.active_idx],
+                        out_buf,
+                        self.cpu_len,
+                    )
+                    used_delta = True
+                except Exception:
+                    used_delta = False
+
+            if (not used_delta) and allow_inplace_delta and self.active_starts is not None:
+                # Fallback path when delta kernel is unavailable.
                 used_delta = self._delta_recall_from_active(
                     starts_cpu, self.gpu_mid[self.active_idx], in_place=True
                 )
                 if used_delta:
                     pending_idx = self.active_idx
                     out_buf = self.gpu_mid[pending_idx]
+
             used_cuda = False
             if (not used_delta) and self.use_cuda_token_recall and hasattr(kernels, "recall_tokens_linear"):
                 try:
