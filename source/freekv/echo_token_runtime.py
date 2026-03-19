@@ -197,6 +197,147 @@ if triton is not None:
         tl.store(o_ptrs, out, mask=mask_d)
 
 
+if triton is not None:
+    @triton.jit
+    def _echo_flash_decode_qk_select_kernel(
+        q_ptr,
+        k_ptr,
+        scores_ptr,
+        best_ptr,
+        stride_q_b,
+        stride_q_h,
+        stride_q_d,
+        stride_k_b,
+        stride_k_h,
+        stride_k_t,
+        stride_k_d,
+        stride_s_b,
+        stride_s_h,
+        stride_s_t,
+        stride_best_b,
+        stride_best_h,
+        stride_best_p,
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        scale,
+        BLOCK_D: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+        MAX_TOKENS: tl.constexpr,
+        MID_START: tl.constexpr,
+        MID_END: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        b = pid // n_q_heads
+        qh = pid - b * n_q_heads
+        kvh = qh // n_q_per_kv
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+        q_ptrs = q_ptr + b * stride_q_b + qh * stride_q_h + offs_d * stride_q_d
+        q_vec = tl.load(q_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+
+        for n0 in tl.static_range(0, MAX_TOKENS, PAGE_SIZE):
+            offs_t = n0 + tl.arange(0, PAGE_SIZE)
+            mask_t = offs_t < seq_len
+            k_ptrs = (
+                k_ptr
+                + b * stride_k_b
+                + kvh * stride_k_h
+                + offs_t[:, None] * stride_k_t
+                + offs_d[None, :] * stride_k_d
+            )
+            k_mat = tl.load(k_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0).to(
+                tl.float32
+            )
+            scores = tl.sum(k_mat * q_vec[None, :], axis=1) * scale
+
+            s_ptrs = scores_ptr + b * stride_s_b + qh * stride_s_h + offs_t * stride_s_t
+            tl.store(s_ptrs, scores, mask=mask_t)
+
+            if n0 >= MID_START and n0 < MID_END:
+                page_idx = (n0 - MID_START) // PAGE_SIZE
+                best_local = tl.argmax(tl.where(mask_t, scores, -float("inf")), axis=0).to(
+                    tl.int32
+                )
+                b_ptr = (
+                    best_ptr
+                    + b * stride_best_b
+                    + qh * stride_best_h
+                    + page_idx * stride_best_p
+                )
+                tl.store(b_ptr, best_local)
+
+
+if triton is not None:
+    @triton.jit
+    def _echo_flash_decode_pv_kernel(
+        scores_ptr,
+        v_ptr,
+        o_ptr,
+        stride_s_b,
+        stride_s_h,
+        stride_s_t,
+        stride_v_b,
+        stride_v_h,
+        stride_v_t,
+        stride_v_d,
+        stride_o_b,
+        stride_o_h,
+        stride_o_d,
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        BLOCK_D: tl.constexpr,
+        PAGE_SIZE: tl.constexpr,
+        MAX_TOKENS: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        b = pid // n_q_heads
+        qh = pid - b * n_q_heads
+        kvh = qh // n_q_per_kv
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+
+        m_i = -float("inf")
+        for n0 in tl.static_range(0, MAX_TOKENS, PAGE_SIZE):
+            offs_t = n0 + tl.arange(0, PAGE_SIZE)
+            mask_t = offs_t < seq_len
+            s_ptrs = scores_ptr + b * stride_s_b + qh * stride_s_h + offs_t * stride_s_t
+            s = tl.load(s_ptrs, mask=mask_t, other=-float("inf"))
+            m_i = tl.maximum(m_i, tl.max(s, axis=0))
+
+        l_i = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for n0 in tl.static_range(0, MAX_TOKENS, PAGE_SIZE):
+            offs_t = n0 + tl.arange(0, PAGE_SIZE)
+            mask_t = offs_t < seq_len
+            s_ptrs = scores_ptr + b * stride_s_b + qh * stride_s_h + offs_t * stride_s_t
+            s = tl.load(s_ptrs, mask=mask_t, other=-float("inf"))
+            p = tl.exp(s - m_i)
+            p = tl.where(mask_t, p, 0.0)
+            l_i += tl.sum(p, axis=0)
+
+            v_ptrs = (
+                v_ptr
+                + b * stride_v_b
+                + kvh * stride_v_h
+                + offs_t[:, None] * stride_v_t
+                + offs_d[None, :] * stride_v_d
+            )
+            v_mat = tl.load(v_ptrs, mask=mask_t[:, None] & mask_d[None, :], other=0.0).to(
+                tl.float32
+            )
+            acc += tl.sum(p[:, None] * v_mat, axis=0)
+
+        out = acc / l_i
+        o_ptrs = o_ptr + b * stride_o_b + qh * stride_o_h + offs_d * stride_o_d
+        tl.store(o_ptrs, out, mask=mask_d)
+
+
 def _triton_qk_page_argmax(
     grouped_q: torch.Tensor,
     mid: torch.Tensor,
@@ -352,6 +493,168 @@ def _triton_flash_decode_attn_with_page_max(
         num_warps=num_warps,
     )
     return out, best
+
+
+def _triton_flash_decode_qk_select(
+    q: torch.Tensor,            # [b, n_q_heads, d]
+    k: torch.Tensor,            # [b, n_kv_heads, s, d]
+    n_q_per_kv: int,
+    page_size: int,
+    mid_start: int,
+    mid_pages: int,
+    max_tokens: int,
+):
+    if triton is None:
+        return None, None
+    if q.device.type != "cuda" or k.device.type != "cuda":
+        return None, None
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None, None
+    if q.dtype != k.dtype:
+        return None, None
+    if q.dim() != 3 or k.dim() != 4:
+        return None, None
+
+    bsz, n_q_heads, head_dim = q.shape
+    if head_dim <= 0 or head_dim > 256:
+        return None, None
+    if n_q_per_kv <= 0 or (n_q_heads % n_q_per_kv) != 0:
+        return None, None
+    n_kv_heads = n_q_heads // n_q_per_kv
+    if k.shape[0] != bsz or k.shape[1] != n_kv_heads or k.shape[3] != head_dim:
+        return None, None
+
+    seq_len = int(k.shape[2])
+    if seq_len <= 0 or max_tokens < seq_len:
+        return None, None
+    if page_size <= 0 or (max_tokens % page_size) != 0:
+        return None, None
+    mid_tokens = int(mid_pages * page_size)
+    mid_end = int(mid_start + mid_tokens)
+    if mid_pages <= 0 or mid_start < 0 or mid_end > seq_len:
+        return None, None
+    if (mid_start % page_size) != 0:
+        return None, None
+
+    q_c = q.contiguous()
+    k_c = k.contiguous()
+    scores = torch.empty(
+        (bsz, n_q_heads, max_tokens),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    best = torch.empty(
+        (bsz, n_q_heads, mid_pages),
+        dtype=torch.int32,
+        device=q.device,
+    )
+
+    block_d = _next_pow2_cap(head_dim, 256)
+    num_warps = 4 if block_d <= 128 else 8
+    grid = (bsz * n_q_heads,)
+    _echo_flash_decode_qk_select_kernel[grid](
+        q_c,
+        k_c,
+        scores,
+        best,
+        q_c.stride(0),
+        q_c.stride(1),
+        q_c.stride(2),
+        k_c.stride(0),
+        k_c.stride(1),
+        k_c.stride(2),
+        k_c.stride(3),
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        best.stride(0),
+        best.stride(1),
+        best.stride(2),
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        1.0 / math.sqrt(float(head_dim)),
+        BLOCK_D=block_d,
+        PAGE_SIZE=page_size,
+        MAX_TOKENS=max_tokens,
+        MID_START=mid_start,
+        MID_END=mid_end,
+        num_warps=num_warps,
+    )
+    return scores, best
+
+
+def _triton_flash_decode_pv_from_scores(
+    scores: torch.Tensor,       # [b, n_q_heads, max_tokens], float32
+    v: torch.Tensor,            # [b, n_kv_heads, s, d]
+    n_q_per_kv: int,
+    seq_len: int,
+):
+    if triton is None:
+        return None
+    if scores.device.type != "cuda" or v.device.type != "cuda":
+        return None
+    if scores.dtype != torch.float32:
+        return None
+    if v.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return None
+    if scores.dim() != 3 or v.dim() != 4:
+        return None
+
+    bsz, n_q_heads, max_tokens = scores.shape
+    n_kv_heads = v.shape[1]
+    head_dim = v.shape[3]
+    if n_q_per_kv <= 0 or n_q_heads != n_kv_heads * n_q_per_kv:
+        return None
+    if seq_len <= 0 or seq_len > max_tokens or seq_len > int(v.shape[2]):
+        return None
+    if head_dim <= 0 or head_dim > 256:
+        return None
+
+    scores_c = scores.contiguous()
+    v_c = v.contiguous()
+    out = torch.empty(
+        (bsz, n_q_heads, head_dim),
+        dtype=torch.float32,
+        device=scores.device,
+    )
+
+    page_size = 32
+    if max_tokens % 128 == 0:
+        page_size = 128
+    elif max_tokens % 64 == 0:
+        page_size = 64
+    if max_tokens % page_size != 0:
+        return None
+
+    block_d = _next_pow2_cap(head_dim, 256)
+    num_warps = 4 if block_d <= 128 else 8
+    grid = (bsz * n_q_heads,)
+    _echo_flash_decode_pv_kernel[grid](
+        scores_c,
+        v_c,
+        out,
+        scores_c.stride(0),
+        scores_c.stride(1),
+        scores_c.stride(2),
+        v_c.stride(0),
+        v_c.stride(1),
+        v_c.stride(2),
+        v_c.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        n_q_heads,
+        n_q_per_kv,
+        seq_len,
+        head_dim,
+        BLOCK_D=block_d,
+        PAGE_SIZE=page_size,
+        MAX_TOKENS=max_tokens,
+        num_warps=num_warps,
+    )
+    return out.to(dtype=v.dtype)
 
 
 class EchoTokenPrefetchRuntime:
@@ -1181,6 +1484,66 @@ class EchoTokenPrefetchRuntime:
         anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
+
+    def qk_select_and_cache_scores(
+        self,
+        q: torch.Tensor,         # [bsz, 1, n_qo_heads, head_dim]
+        local_k: torch.Tensor,   # [eff/bsz, n_kv_heads, s, head_dim]
+    ) -> Optional[torch.Tensor]:
+        # Split-flash stage-1: QK + page argmax (anchor update), returns score cache.
+        if (not self.use_triton_flash_attn) or self.mid_pages <= 0:
+            return None
+        if self.active_starts is None:
+            return None
+        bsz = q.shape[0]
+        if local_k.shape[0] != bsz:
+            q_use = q[:1]
+        else:
+            q_use = q
+        q_compact = q_use[:, 0].contiguous()  # [eff, n_qo_heads, head_dim]
+        scores, qh_best = _triton_flash_decode_qk_select(
+            q_compact,
+            local_k,
+            n_q_per_kv=self.n_q_per_kv,
+            page_size=self.page_size,
+            mid_start=self.sink_len,
+            mid_pages=self.mid_pages,
+            max_tokens=self.local_total_cap,
+        )
+        if scores is None or qh_best is None:
+            return None
+
+        local_best = qh_best.view(
+            qh_best.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
+        ).float().mean(dim=(1, 2)).round().to(torch.int32)
+        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
+        anchors = self.active_starts + local_best_cpu
+        anchors, _ = torch.sort(anchors, dim=-1)
+        self.anchors = anchors.to(dtype=torch.int32).contiguous()
+        return scores
+
+    def pv_from_score_cache(
+        self,
+        scores: torch.Tensor,     # [eff, n_qo_heads, max_tokens]
+        local_v: torch.Tensor,    # [eff/bsz, n_kv_heads, s, head_dim]
+        out_bsz: int,
+    ) -> Optional[torch.Tensor]:
+        # Split-flash stage-2: P@V from cached QK scores.
+        if scores is None:
+            return None
+        seq_len = int(local_v.shape[2])
+        out_compact = _triton_flash_decode_pv_from_scores(
+            scores,
+            local_v,
+            n_q_per_kv=self.n_q_per_kv,
+            seq_len=seq_len,
+        )
+        if out_compact is None:
+            return None
+        out = out_compact.unsqueeze(1).contiguous()  # [eff, 1, n_qo_heads, head_dim]
+        if out.shape[0] == 1 and out_bsz > 1:
+            out = out.expand(out_bsz, -1, -1, -1).contiguous()
+        return out
 
     def attend_and_update_anchors_fused(
         self,

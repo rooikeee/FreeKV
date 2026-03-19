@@ -753,31 +753,48 @@ class InferState:
                 out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
         elif self.echo_attn_backend == "flash_attn":
-            # Flash-Attn backend with Triton-fused attention+anchor update preference.
+            # Split-flash path:
+            # stage-1 QK(+anchor) -> launch next recall -> stage-2 P@V/flash-attn.
             pack_t0 = self._perf_start("pack")
-            local_k, local_v, k_mid = rt.local_kv(q.shape[0])
+            local_k, local_v, _ = rt.local_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)
 
+            sel_t0 = self._perf_start("select")
+            score_cache = rt.qk_select_and_cache_scores(q, local_k)
+            self._perf_stop("select", sel_t0)
+
+            if score_cache is not None:
+                next_starts = rt.build_starts(cur_seq + 1)
+                if next_starts is not None:
+                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                    rt.launch_prefetch(
+                        next_starts,
+                        target_seq_len=cur_seq + 1,
+                        allow_inplace_delta=False,
+                    )
+                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+
             attn_t0 = self._perf_start("attn")
-            out, fused_select = rt.attend_and_update_anchors_fused(q, local_k, local_v)
-            if not fused_select:
+            out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
+            if out is None:
                 out = rt.attend_flash_attn(q, local_k, local_v, strict=True)
             self._perf_stop("attn", attn_t0)
 
-            if not fused_select:
+            if score_cache is None:
                 sel_t0 = self._perf_start("select")
+                k_mid = local_k[:, :, rt.sink_len : rt.sink_len + rt.mid_tokens]
                 rt.update_anchors_from_middle(q, k_mid)
                 self._perf_stop("select", sel_t0)
 
-            next_starts = rt.build_starts(cur_seq + 1)
-            if next_starts is not None:
-                rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
-                rt.launch_prefetch(
-                    next_starts,
-                    target_seq_len=cur_seq + 1,
-                    allow_inplace_delta=False,
-                )
-                self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+                next_starts = rt.build_starts(cur_seq + 1)
+                if next_starts is not None:
+                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                    rt.launch_prefetch(
+                        next_starts,
+                        target_seq_len=cur_seq + 1,
+                        allow_inplace_delta=False,
+                    )
+                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
         else:
             pack_t0 = self._perf_start("pack")
             local_k, local_v, k_mid = rt.local_kv(q.shape[0])
