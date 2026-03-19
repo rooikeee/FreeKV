@@ -61,6 +61,24 @@ inline void memcpy_async_checked(
   TORCH_CHECK(err == cudaSuccess, tag, " cudaMemcpyAsync failed: ", cudaGetErrorString(err));
 }
 
+inline void memcpy2d_async_checked(
+    void* dst,
+    size_t dst_pitch,
+    const void* src,
+    size_t src_pitch,
+    size_t width,
+    size_t height,
+    cudaMemcpyKind kind,
+    cudaStream_t stream,
+    const char* tag) {
+  if (width == 0 || height == 0) {
+    return;
+  }
+  cudaError_t err =
+      cudaMemcpy2DAsync(dst, dst_pitch, src, src_pitch, width, height, kind, stream);
+  TORCH_CHECK(err == cudaSuccess, tag, " cudaMemcpy2DAsync failed: ", cudaGetErrorString(err));
+}
+
 }  // namespace
 
 void recall_tokens_linear(
@@ -215,6 +233,7 @@ void recall_tokens_delta_linear(
 
     const size_t token_bytes = static_cast<size_t>(dst_stride_tok) * sizeof(scalar_t);
     const size_t page_bytes = static_cast<size_t>(page_size) * token_bytes;
+    const size_t page_pitch_bytes = static_cast<size_t>(page_size) * token_bytes;
 
     for (int64_t b = 0; b < bsz; ++b) {
       const int64_t sb_new = (starts_bsz == 1) ? 0 : b;
@@ -231,8 +250,27 @@ void recall_tokens_delta_linear(
 
         if (same_buffer) {
           if (shift != 0) {
+            int64_t run_pages = 1;
+            while (p + run_pages < n_pages) {
+              const int64_t sn =
+                  static_cast<int64_t>(starts_ptr[sb_new * n_pages + p + run_pages]);
+              const int64_t so =
+                  static_cast<int64_t>(prev_starts_ptr[sb_old * n_pages + p + run_pages]);
+              if (sn == so || sn != s_new + run_pages * page_size) {
+                break;
+              }
+              ++run_pages;
+            }
             scalar_t* src_ptr = src_base + b * src_stride_b + s_new * cpu_stride_tok;
-            memcpy_async_checked(dst_page, src_ptr, page_bytes, cudaMemcpyHostToDevice, stream, "recall_tokens_delta_linear(same_buffer)");
+            memcpy_async_checked(
+                dst_page,
+                src_ptr,
+                page_bytes * static_cast<size_t>(run_pages),
+                cudaMemcpyHostToDevice,
+                stream,
+                "recall_tokens_delta_linear(same_buffer)");
+            p += run_pages;
+            continue;
           }
           ++p;
           continue;
@@ -285,23 +323,47 @@ void recall_tokens_delta_linear(
           continue;
         }
 
+        int64_t run_pages = 1;
+        while (p + run_pages < n_pages) {
+          const int64_t sn = static_cast<int64_t>(starts_ptr[sb_new * n_pages + p + run_pages]);
+          const int64_t so =
+              static_cast<int64_t>(prev_starts_ptr[sb_old * n_pages + p + run_pages]);
+          const int64_t sh = sn - so;
+          if (sh != shift) {
+            break;
+          }
+          if (sn != s_new + run_pages * page_size) {
+            break;
+          }
+          if (so != s_old + run_pages * page_size) {
+            break;
+          }
+          ++run_pages;
+        }
+
         if (shift > 0) {
           const int64_t overlap = page_size - shift;
           scalar_t* d2d_src = prev_page + shift * prev_stride_tok;
-          memcpy_async_checked(
+          memcpy2d_async_checked(
               dst_page,
+              page_pitch_bytes,
               d2d_src,
+              page_pitch_bytes,
               static_cast<size_t>(overlap) * token_bytes,
+              static_cast<size_t>(run_pages),
               cudaMemcpyDeviceToDevice,
               stream,
               "recall_tokens_delta_linear(d2d_tail)");
 
           scalar_t* h2d_src = src_base + b * src_stride_b + (s_new + overlap) * cpu_stride_tok;
           scalar_t* h2d_dst = dst_page + overlap * dst_stride_tok;
-          memcpy_async_checked(
+          memcpy2d_async_checked(
               h2d_dst,
+              page_pitch_bytes,
               h2d_src,
+              page_pitch_bytes,
               static_cast<size_t>(shift) * token_bytes,
+              static_cast<size_t>(run_pages),
               cudaMemcpyHostToDevice,
               stream,
               "recall_tokens_delta_linear(h2d_tail)");
@@ -309,25 +371,31 @@ void recall_tokens_delta_linear(
           const int64_t shift_abs = -shift;
           const int64_t overlap = page_size - shift_abs;
           scalar_t* d2d_dst = dst_page + shift_abs * dst_stride_tok;
-          memcpy_async_checked(
+          memcpy2d_async_checked(
               d2d_dst,
+              page_pitch_bytes,
               prev_page,
+              page_pitch_bytes,
               static_cast<size_t>(overlap) * token_bytes,
+              static_cast<size_t>(run_pages),
               cudaMemcpyDeviceToDevice,
               stream,
               "recall_tokens_delta_linear(d2d_head)");
 
           scalar_t* h2d_src = src_base + b * src_stride_b + s_new * cpu_stride_tok;
-          memcpy_async_checked(
+          memcpy2d_async_checked(
               dst_page,
+              page_pitch_bytes,
               h2d_src,
+              page_pitch_bytes,
               static_cast<size_t>(shift_abs) * token_bytes,
+              static_cast<size_t>(run_pages),
               cudaMemcpyHostToDevice,
               stream,
               "recall_tokens_delta_linear(h2d_head)");
         }
 
-        ++p;
+        p += run_pages;
       }
     }
     return true;

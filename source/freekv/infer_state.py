@@ -192,6 +192,12 @@ class InferState:
         self.echo_use_triton_flash_attn = bool(
             kwargs.get("echo_use_triton_flash_attn", True)
         )
+        self.echo_allow_anchor_overlap = bool(
+            kwargs.get("echo_allow_anchor_overlap", True)
+        )
+        self.echo_prefer_flash_attn_package = bool(
+            kwargs.get("echo_prefer_flash_attn_package", False)
+        )
         self.echo_require_triton_flash = bool(
             kwargs.get("echo_require_triton_flash", True)
         )
@@ -294,6 +300,8 @@ class InferState:
                     anchor_head_sample=self.echo_anchor_head_sample,
                     use_triton_qk_select=self.echo_use_triton_qk_select,
                     use_triton_flash_attn=self.echo_use_triton_flash_attn,
+                    allow_anchor_overlap=self.echo_allow_anchor_overlap,
+                    prefer_flash_attn_package=self.echo_prefer_flash_attn_package,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -759,7 +767,7 @@ class InferState:
             # Modified Triton flash-attn path:
             # stage-1: QK + page-argmax anchors
             # stage-2: launch next recall immediately
-            # stage-3: P@V from stage-1 score cache
+            # stage-3: P@V from stage-1 score cache (no extra QK)
             pack_t0 = self._perf_start("pack")
             local_k, local_v, _ = rt.local_kv(q.shape[0])
             self._perf_stop("pack", pack_t0)

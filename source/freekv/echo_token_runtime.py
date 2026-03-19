@@ -846,6 +846,8 @@ class EchoTokenPrefetchRuntime:
         anchor_head_sample: int = 0,
         use_triton_qk_select: bool = True,
         use_triton_flash_attn: bool = True,
+        allow_anchor_overlap: bool = True,
+        prefer_flash_attn_package: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -861,6 +863,8 @@ class EchoTokenPrefetchRuntime:
         self.anchor_head_sample = int(anchor_head_sample)
         self.use_triton_qk_select = bool(use_triton_qk_select and (triton is not None))
         self.use_triton_flash_attn = bool(use_triton_flash_attn and (triton is not None))
+        self.allow_anchor_overlap = bool(allow_anchor_overlap)
+        self.prefer_flash_attn_package = bool(prefer_flash_attn_package)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -911,6 +915,9 @@ class EchoTokenPrefetchRuntime:
         self.prefetch_ready = False
 
         self.anchors = None  # [eff_bsz, mid_pages], token indices
+        self.prefetch_hint_starts = None  # [eff_bsz, mid_pages], int32 cpu
+        self.prefetch_hint_seq_len = -1
+        self.slide_half_window = self.page_size // 2
         self._head_idx = None
 
     def _effective_batch(self, bsz: int) -> int:
@@ -1017,6 +1024,8 @@ class EchoTokenPrefetchRuntime:
         self.pending_starts = None
         self.active_starts = None
         self.prefetch_ready = False
+        self.prefetch_hint_starts = None
+        self.prefetch_hint_seq_len = -1
         self.local_mid_ready = [False, False]
         self.local_sink_len_cached = [0, 0]
         self.page_mid_ready = [False, False]
@@ -1292,6 +1301,7 @@ class EchoTokenPrefetchRuntime:
     def init_anchors_from_prefill(self, q_last: torch.Tensor, k_full: torch.Tensor):
         # q_last: [bsz, 1, n_qo_heads, head_dim]
         # k_full: [bsz, seq_len, n_kv_heads, head_dim]
+        self._set_prefetch_hint(None, -1)
         if self.mid_pages <= 0:
             self.anchors = None
             return
@@ -1330,6 +1340,8 @@ class EchoTokenPrefetchRuntime:
             return torch.full_like(anchors, lower)
 
         ideal = torch.clamp(anchors - self.page_size // 2, min=lower, max=max_start)
+        if self.allow_anchor_overlap:
+            return ideal.to(dtype=torch.int32).contiguous()
         ideal, _ = torch.sort(ideal, dim=-1)
 
         penalty = torch.arange(self.mid_pages, device=anchors.device, dtype=ideal.dtype)
@@ -1347,8 +1359,49 @@ class EchoTokenPrefetchRuntime:
         starts = torch.clamp(starts, min=lower, max=max_start)
         return starts.to(dtype=torch.int32).contiguous()
 
+    def _set_prefetch_hint(self, starts: Optional[torch.Tensor], target_seq_len: int):
+        if starts is None:
+            self.prefetch_hint_starts = None
+            self.prefetch_hint_seq_len = -1
+            return
+        if starts.dtype != torch.int32 or (not starts.is_contiguous()):
+            starts = starts.to(dtype=torch.int32).contiguous()
+        if starts.device.type != "cpu":
+            starts = starts.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+        self.prefetch_hint_starts = starts
+        self.prefetch_hint_seq_len = int(target_seq_len)
+
+    def _starts_from_local_best(
+        self,
+        local_best_cpu_i32: torch.Tensor,
+        target_seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        if self.active_starts is None:
+            return None
+        bounds = self.middle_bounds(int(target_seq_len))
+        if bounds is None:
+            return None
+        lower, upper = bounds
+        max_start = upper - self.page_size
+        if max_start < lower:
+            return None
+
+        local_best_cpu_i32 = local_best_cpu_i32.to(
+            device=torch.device("cpu"), dtype=torch.int32
+        ).contiguous()
+        starts = self.active_starts + local_best_cpu_i32 - int(self.slide_half_window)
+        starts = torch.clamp(starts, min=lower, max=max_start)
+        return starts.to(dtype=torch.int32).contiguous()
+
     def build_starts(self, seq_len: int) -> Optional[torch.Tensor]:
-        if self.mid_pages <= 0 or self.anchors is None:
+        if self.mid_pages <= 0:
+            return None
+        if (
+            self.prefetch_hint_starts is not None
+            and self.prefetch_hint_seq_len == int(seq_len)
+        ):
+            return self.prefetch_hint_starts
+        if self.anchors is None:
             return None
         anchors = self.anchors
         if anchors.dim() == 3:
@@ -1629,9 +1682,14 @@ class EchoTokenPrefetchRuntime:
                 self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
             )
             local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
-        anchors = starts + local_best
+        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
+        anchors = starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+        self._set_prefetch_hint(
+            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self.cpu_len + 1,
+        )
 
     def update_anchors_from_active_mid(self, q: torch.Tensor):
         # Use active gpu_mid directly to avoid extra permute/contiguous on flashinfer path.
@@ -1669,6 +1727,10 @@ class EchoTokenPrefetchRuntime:
         anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
+        self._set_prefetch_hint(
+            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self.cpu_len + 1,
+        )
 
     def qk_select_and_cache_scores(
         self,
@@ -1705,6 +1767,10 @@ class EchoTokenPrefetchRuntime:
         anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
+        self._set_prefetch_hint(
+            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self.cpu_len + 1,
+        )
         return scores
 
     def pv_from_score_cache(
@@ -1769,6 +1835,10 @@ class EchoTokenPrefetchRuntime:
         anchors = self.active_starts + local_best_cpu
         anchors, _ = torch.sort(anchors, dim=-1)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
+        self._set_prefetch_hint(
+            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self.cpu_len + 1,
+        )
 
         out = fused_out.unsqueeze(1).contiguous()  # [eff, 1, n_qo_heads, head_dim]
         if out.shape[0] == 1 and bsz > 1:
@@ -1823,33 +1893,24 @@ class EchoTokenPrefetchRuntime:
         else:
             q_use = q
 
-        out_compact = None
-        if self.use_triton_flash_attn:
-            q_compact = q_use[:, 0].contiguous()  # [eff, n_q_heads, d]
-            out_compact = _triton_flash_decode_attn_plain(
-                q_compact,
-                local_k,
-                local_v,
-                n_q_per_kv=self.n_q_per_kv,
-                max_tokens=self.local_total_cap,
-            )
-        if out_compact is not None:
-            out = out_compact.unsqueeze(1).contiguous()
-        else:
-            if flash_attn_func is None:
-                if strict:
-                    raise RuntimeError(
-                        "echo_attn_backend=flash_attn requested, but Triton plain flash-attn "
-                        "kernel is unavailable and flash_attn package is not installed."
-                    )
-                return self.attend(q, local_k, local_v)
+        out = None
+        prefer_pkg = bool(self.prefer_flash_attn_package)
 
+        if prefer_pkg and strict and flash_attn_func is None:
+            raise RuntimeError(
+                "echo_attn_backend=flash_attn requires flash_attn package, "
+                "but flash_attn is not installed."
+            )
+
+        def _call_flash_attn_pkg() -> Optional[torch.Tensor]:
+            if flash_attn_func is None:
+                return None
             q_in = q_use.contiguous()  # [eff, 1, n_q_heads, d]
             k_in = local_k.transpose(1, 2).contiguous()  # [eff, s, n_kv_heads, d]
             v_in = local_v.transpose(1, 2).contiguous()
             try:
                 # Prefer native GQA path to avoid per-step key/value head expansion.
-                out = flash_attn_func(
+                return flash_attn_func(
                     q_in,
                     k_in,
                     v_in,
@@ -1862,7 +1923,7 @@ class EchoTokenPrefetchRuntime:
                     raise
                 k_rep = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
                 v_rep = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
-                out = flash_attn_func(
+                return flash_attn_func(
                     q_in,
                     k_rep,
                     v_rep,
@@ -1870,6 +1931,36 @@ class EchoTokenPrefetchRuntime:
                     softmax_scale=None,
                     causal=False,
                 )
+            except Exception:
+                if strict and prefer_pkg:
+                    raise
+                return None
+
+        if prefer_pkg:
+            out = _call_flash_attn_pkg()
+
+        if out is None and self.use_triton_flash_attn:
+            q_compact = q_use[:, 0].contiguous()  # [eff, n_q_heads, d]
+            out_compact = _triton_flash_decode_attn_plain(
+                q_compact,
+                local_k,
+                local_v,
+                n_q_per_kv=self.n_q_per_kv,
+                max_tokens=self.local_total_cap,
+            )
+            if out_compact is not None:
+                out = out_compact.unsqueeze(1).contiguous()
+
+        if out is None and (not prefer_pkg):
+            out = _call_flash_attn_pkg()
+
+        if out is None:
+            if strict:
+                raise RuntimeError(
+                    "echo_attn_backend=flash_attn requested, but neither flash_attn package "
+                    "nor Triton plain flash-attn kernel is available."
+                )
+            return self.attend(q, local_k, local_v)
         if out.shape[0] == 1 and bsz > 1:
             out = out.expand(bsz, -1, -1, -1).contiguous()
         return out
