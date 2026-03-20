@@ -833,13 +833,14 @@ class InferState:
                 stream_prefetch_ready = False
                 score_cache = None
 
-                sel_t0 = self._perf_start("select")
                 if rt.stream_prefetch_only:
+                    rec_sel_t0 = self._perf_start("recall", stream=rt.recall_stream)
                     stream_prefetch_ready = rt.select_and_prefetch_stream_only(
                         q,
                         local_k,
                         target_seq_len=cur_seq + 1,
                     )
+                    self._perf_stop("recall", rec_sel_t0, stream=rt.recall_stream)
                     if (not stream_prefetch_ready):
                         if self.echo_require_triton_flash:
                             raise RuntimeError(
@@ -847,6 +848,7 @@ class InferState:
                                 "which means chunk-level CUDA page-max + partial recall "
                                 "did not run. Disable strict mode or disable stream_prefetch_only."
                             )
+                        sel_t0 = self._perf_start("select")
                         score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
                             q,
                             local_k,
@@ -855,7 +857,9 @@ class InferState:
                         stream_prefetch_ready = score_cache is not None
                         if score_cache is None:
                             score_cache = rt.qk_select_and_cache_scores(q, local_k)
+                        self._perf_stop("select", sel_t0)
                 else:
+                    sel_t0 = self._perf_start("select")
                     score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
                         q,
                         local_k,
@@ -864,7 +868,7 @@ class InferState:
                     stream_prefetch_ready = score_cache is not None
                     if score_cache is None:
                         score_cache = rt.qk_select_and_cache_scores(q, local_k)
-                self._perf_stop("select", sel_t0)
+                    self._perf_stop("select", sel_t0)
 
                 if (not stream_prefetch_ready) and score_cache is None:
                     if self.echo_require_triton_flash:
