@@ -249,14 +249,34 @@ void recall_tokens_delta_linear(
         scalar_t* prev_page = prev_base + b * prev_stride_b + (p * page_size) * prev_stride_tok;
 
         if (same_buffer) {
-          if (shift != 0) {
+          if (shift == 0) {
             int64_t run_pages = 1;
             while (p + run_pages < n_pages) {
               const int64_t sn =
                   static_cast<int64_t>(starts_ptr[sb_new * n_pages + p + run_pages]);
               const int64_t so =
                   static_cast<int64_t>(prev_starts_ptr[sb_old * n_pages + p + run_pages]);
-              if (sn == so || sn != s_new + run_pages * page_size) {
+              if (sn != so) {
+                break;
+              }
+              ++run_pages;
+            }
+            p += run_pages;
+            continue;
+          }
+
+          if (shift >= page_size || shift <= -page_size) {
+            int64_t run_pages = 1;
+            while (p + run_pages < n_pages) {
+              const int64_t sn =
+                  static_cast<int64_t>(starts_ptr[sb_new * n_pages + p + run_pages]);
+              const int64_t so =
+                  static_cast<int64_t>(prev_starts_ptr[sb_old * n_pages + p + run_pages]);
+              const int64_t sh = sn - so;
+              if (!(sh >= page_size || sh <= -page_size)) {
+                break;
+              }
+              if (sn != s_new + run_pages * page_size) {
                 break;
               }
               ++run_pages;
@@ -268,11 +288,56 @@ void recall_tokens_delta_linear(
                 page_bytes * static_cast<size_t>(run_pages),
                 cudaMemcpyHostToDevice,
                 stream,
-                "recall_tokens_delta_linear(same_buffer)");
+                "recall_tokens_delta_linear(same_buffer_full)");
             p += run_pages;
             continue;
           }
-          ++p;
+
+          int64_t run_pages = 1;
+          while (p + run_pages < n_pages) {
+            const int64_t sn =
+                static_cast<int64_t>(starts_ptr[sb_new * n_pages + p + run_pages]);
+            const int64_t so =
+                static_cast<int64_t>(prev_starts_ptr[sb_old * n_pages + p + run_pages]);
+            const int64_t sh = sn - so;
+            if (sh != shift) {
+              break;
+            }
+            if (sn != s_new + run_pages * page_size) {
+              break;
+            }
+            ++run_pages;
+          }
+
+          if (shift > 0) {
+            const int64_t overlap = page_size - shift;
+            scalar_t* h2d_src = src_base + b * src_stride_b + (s_new + overlap) * cpu_stride_tok;
+            scalar_t* h2d_dst = dst_page + overlap * dst_stride_tok;
+            memcpy2d_async_checked(
+                h2d_dst,
+                page_pitch_bytes,
+                h2d_src,
+                page_pitch_bytes,
+                static_cast<size_t>(shift) * token_bytes,
+                static_cast<size_t>(run_pages),
+                cudaMemcpyHostToDevice,
+                stream,
+                "recall_tokens_delta_linear(same_buffer_h2d_tail)");
+          } else {
+            const int64_t shift_abs = -shift;
+            scalar_t* h2d_src = src_base + b * src_stride_b + s_new * cpu_stride_tok;
+            memcpy2d_async_checked(
+                dst_page,
+                page_pitch_bytes,
+                h2d_src,
+                page_pitch_bytes,
+                static_cast<size_t>(shift_abs) * token_bytes,
+                static_cast<size_t>(run_pages),
+                cudaMemcpyHostToDevice,
+                stream,
+                "recall_tokens_delta_linear(same_buffer_h2d_head)");
+          }
+          p += run_pages;
           continue;
         }
 
@@ -400,4 +465,78 @@ void recall_tokens_delta_linear(
     }
     return true;
   });
+}
+
+void recall_tokens_linear_partial(
+    const torch::Tensor &token_starts,
+    const torch::Tensor &cpu_kv_linear,
+    torch::Tensor gpu_mid_kv,
+    int64_t valid_tokens,
+    int64_t page_begin,
+    int64_t page_count
+) {
+  TORCH_CHECK(token_starts.dim() == 2, "token_starts must be 2D");
+  const int64_t n_pages = token_starts.size(1);
+  TORCH_CHECK(page_begin >= 0, "page_begin must be >= 0");
+  TORCH_CHECK(page_count >= 0, "page_count must be >= 0");
+  TORCH_CHECK(
+      page_begin + page_count <= n_pages,
+      "page_begin + page_count exceeds token_starts second dim");
+  if (page_count == 0) {
+    return;
+  }
+
+  TORCH_CHECK(gpu_mid_kv.dim() == 5, "gpu_mid_kv must be 5D");
+  TORCH_CHECK(n_pages > 0, "token_starts second dim (n_pages) must be > 0");
+  TORCH_CHECK(
+      gpu_mid_kv.size(1) % n_pages == 0,
+      "gpu_mid_kv token dim must be divisible by n_pages");
+  const int64_t page_size = gpu_mid_kv.size(1) / n_pages;
+
+  auto starts_part = token_starts.narrow(1, page_begin, page_count);
+  auto gpu_part = gpu_mid_kv.narrow(1, page_begin * page_size, page_count * page_size);
+  recall_tokens_linear(starts_part, cpu_kv_linear, gpu_part, valid_tokens);
+}
+
+void recall_tokens_delta_linear_partial(
+    const torch::Tensor &token_starts,
+    const torch::Tensor &prev_token_starts,
+    const torch::Tensor &cpu_kv_linear,
+    const torch::Tensor &gpu_prev_mid_kv,
+    torch::Tensor gpu_mid_kv,
+    int64_t valid_tokens,
+    int64_t page_begin,
+    int64_t page_count
+) {
+  TORCH_CHECK(token_starts.dim() == 2, "token_starts must be 2D");
+  TORCH_CHECK(prev_token_starts.dim() == 2, "prev_token_starts must be 2D");
+  TORCH_CHECK(
+      token_starts.size(1) == prev_token_starts.size(1),
+      "token_starts and prev_token_starts must have same n_pages");
+  const int64_t n_pages = token_starts.size(1);
+  TORCH_CHECK(page_begin >= 0, "page_begin must be >= 0");
+  TORCH_CHECK(page_count >= 0, "page_count must be >= 0");
+  TORCH_CHECK(
+      page_begin + page_count <= n_pages,
+      "page_begin + page_count exceeds token_starts second dim");
+  if (page_count == 0) {
+    return;
+  }
+
+  TORCH_CHECK(gpu_mid_kv.dim() == 5, "gpu_mid_kv must be 5D");
+  TORCH_CHECK(gpu_prev_mid_kv.dim() == 5, "gpu_prev_mid_kv must be 5D");
+  TORCH_CHECK(gpu_prev_mid_kv.sizes() == gpu_mid_kv.sizes(), "gpu_prev_mid_kv/gpu_mid_kv shape mismatch");
+  TORCH_CHECK(n_pages > 0, "token_starts second dim (n_pages) must be > 0");
+  TORCH_CHECK(
+      gpu_mid_kv.size(1) % n_pages == 0,
+      "gpu_mid_kv token dim must be divisible by n_pages");
+  const int64_t page_size = gpu_mid_kv.size(1) / n_pages;
+
+  auto starts_part = token_starts.narrow(1, page_begin, page_count);
+  auto prev_part = prev_token_starts.narrow(1, page_begin, page_count);
+  auto prev_gpu_part =
+      gpu_prev_mid_kv.narrow(1, page_begin * page_size, page_count * page_size);
+  auto gpu_part = gpu_mid_kv.narrow(1, page_begin * page_size, page_count * page_size);
+  recall_tokens_delta_linear(
+      starts_part, prev_part, cpu_kv_linear, prev_gpu_part, gpu_part, valid_tokens);
 }

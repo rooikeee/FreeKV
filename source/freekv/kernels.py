@@ -451,6 +451,44 @@ def recall_tokens_delta_linear(
         valid_tokens,
     )
 
+def recall_tokens_linear_partial(
+    token_starts,        # [bsz or 1, n_pages], int32
+    cpu_kv_linear,       # [bsz, max_tokens, 2, n_kv_heads, head_dim], pinned CPU
+    gpu_mid_kv,          # [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    valid_tokens: int,
+    page_begin: int,
+    page_count: int,
+):
+    _cpp.recall_tokens_linear_partial(
+        token_starts,
+        cpu_kv_linear,
+        gpu_mid_kv,
+        valid_tokens,
+        page_begin,
+        page_count,
+    )
+
+def recall_tokens_delta_linear_partial(
+    token_starts,          # [bsz or 1, n_pages], int32
+    prev_token_starts,     # [bsz or 1, n_pages], int32
+    cpu_kv_linear,         # [bsz, max_tokens, 2, n_kv_heads, head_dim], pinned CPU
+    gpu_prev_mid_kv,       # [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    gpu_mid_kv,            # [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    valid_tokens: int,
+    page_begin: int,
+    page_count: int,
+):
+    _cpp.recall_tokens_delta_linear_partial(
+        token_starts,
+        prev_token_starts,
+        cpu_kv_linear,
+        gpu_prev_mid_kv,
+        gpu_mid_kv,
+        valid_tokens,
+        page_begin,
+        page_count,
+    )
+
 def estimate_select_recall_pool(
     # for estimate
     query_states,

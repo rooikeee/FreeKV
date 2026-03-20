@@ -201,6 +201,7 @@ class InferState:
         self.echo_require_triton_flash = bool(
             kwargs.get("echo_require_triton_flash", True)
         )
+        self.echo_stream_chunk_pages = int(kwargs.get("echo_stream_chunk_pages", 4))
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "sdpa")).lower()
         self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "fused_fast")).lower()
@@ -308,6 +309,7 @@ class InferState:
                     prefer_flash_attn_package=self.echo_prefer_flash_attn_package,
                     enable_local_kv=enable_local_kv,
                     enable_page_kv=enable_page_kv,
+                    stream_chunk_pages=self.echo_stream_chunk_pages,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -779,7 +781,14 @@ class InferState:
                 self._perf_stop("pack", pack_t0)
 
                 sel_t0 = self._perf_start("select")
-                score_cache = rt.qk_select_and_cache_scores(q, local_k)
+                score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
+                    q,
+                    local_k,
+                    target_seq_len=cur_seq + 1,
+                )
+                stream_prefetch_ready = score_cache is not None
+                if score_cache is None:
+                    score_cache = rt.qk_select_and_cache_scores(q, local_k)
                 self._perf_stop("select", sel_t0)
                 if score_cache is None:
                     if self.echo_require_triton_flash:
@@ -791,15 +800,16 @@ class InferState:
                     rt.update_anchors_from_active_mid(q)
                     self._perf_stop("select", sel_fb_t0)
 
-                next_starts = rt.build_starts(cur_seq + 1)
-                if next_starts is not None:
-                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
-                    rt.launch_prefetch(
-                        next_starts,
-                        target_seq_len=cur_seq + 1,
-                        allow_inplace_delta=True,
-                    )
-                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+                if not stream_prefetch_ready:
+                    next_starts = rt.build_starts(cur_seq + 1)
+                    if next_starts is not None:
+                        rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                        rt.launch_prefetch(
+                            next_starts,
+                            target_seq_len=cur_seq + 1,
+                            allow_inplace_delta=True,
+                        )
+                        self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
                 attn_t0 = self._perf_start("attn")
                 out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])

@@ -850,6 +850,7 @@ class EchoTokenPrefetchRuntime:
         prefer_flash_attn_package: bool = True,
         enable_local_kv: bool = True,
         enable_page_kv: bool = True,
+        stream_chunk_pages: int = 4,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -869,6 +870,7 @@ class EchoTokenPrefetchRuntime:
         self.prefer_flash_attn_package = bool(prefer_flash_attn_package)
         self.enable_local_kv = bool(enable_local_kv)
         self.enable_page_kv = bool(enable_page_kv)
+        self.stream_chunk_pages = int(max(1, stream_chunk_pages))
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -1494,6 +1496,46 @@ class EchoTokenPrefetchRuntime:
                     non_blocking=True,
                 )
 
+    def _fallback_recall_partial(
+        self,
+        starts: torch.Tensor,
+        out_buf: torch.Tensor,
+        page_begin: int,
+        page_count: int,
+    ):
+        if page_count <= 0:
+            return
+        starts_cpu = starts.to(device=torch.device("cpu"), dtype=torch.long)
+        p_end = int(page_begin + page_count)
+        for b in range(starts_cpu.shape[0]):
+            for p in range(int(page_begin), p_end):
+                s = int(starts_cpu[b, p].item())
+                e = s + self.page_size
+                off = p * self.page_size
+                out_buf[b, off : off + self.page_size].copy_(
+                    self.cpu_kv[b, s:e],
+                    non_blocking=True,
+                )
+
+    def _fill_qk_scores_segment(
+        self,
+        scores: torch.Tensor,       # [eff, n_q_heads, max_tokens], float32
+        q_group_f32: torch.Tensor,  # [eff, n_kv_heads, n_q_per_kv, head_dim], float32
+        local_k: torch.Tensor,      # [eff, n_kv_heads, seq_len, head_dim]
+        tok_begin: int,
+        tok_end: int,
+    ):
+        tok_begin = int(max(0, tok_begin))
+        tok_end = int(min(int(local_k.shape[2]), tok_end))
+        if tok_end <= tok_begin:
+            return
+        k_seg = local_k[:, :, tok_begin:tok_end].to(dtype=torch.float32)
+        seg = torch.einsum("bgqd,bgtd->bgqt", q_group_f32, k_seg)
+        seg = (seg * self._inv_sqrt_head_dim).reshape(
+            q_group_f32.shape[0], self.n_qo_heads, tok_end - tok_begin
+        )
+        scores[:, :, tok_begin:tok_end].copy_(seg, non_blocking=True)
+
     def _delta_recall_from_active(
         self, starts_cpu_i32: torch.Tensor, out_buf: torch.Tensor, in_place: bool = False
     ) -> bool:
@@ -1543,13 +1585,11 @@ class EchoTokenPrefetchRuntime:
         else:
             starts_i32 = starts
         starts_cpu = starts_i32 if starts_i32.device.type == "cpu" else starts_i32.to("cpu")
-        prev_active_starts = self.active_starts
         pending_idx = 1 - self.active_idx
         out_buf = self.gpu_mid[pending_idx]
 
         with torch.cuda.stream(self.recall_stream):
             used_delta = False
-            used_cuda_inplace_delta = False
             if (
                 allow_inplace_delta
                 and self.active_starts is not None
@@ -1569,10 +1609,8 @@ class EchoTokenPrefetchRuntime:
                     pending_idx = self.active_idx
                     out_buf = self.gpu_mid[pending_idx]
                     used_delta = True
-                    used_cuda_inplace_delta = True
                 except Exception:
                     used_delta = False
-                    used_cuda_inplace_delta = False
             if (
                 (not used_delta)
                 and allow_inplace_delta
@@ -1623,71 +1661,31 @@ class EchoTokenPrefetchRuntime:
                 local_k = self.local_k_buf[self.pending_idx]
                 local_v = self.local_v_buf[self.pending_idx]
                 off = self.sink_len
-                if used_cuda_inplace_delta and prev_active_starts is not None:
-                    changed = starts_cpu.ne(prev_active_starts)
-                    if bool(changed.any()):
-                        idxs = torch.nonzero(changed, as_tuple=False)
-                        for bt in idxs:
-                            b = int(bt[0].item())
-                            p = int(bt[1].item())
-                            t0 = p * self.page_size
-                            t1 = t0 + self.page_size
-                            local_k[b : b + 1, :, off + t0 : off + t1].copy_(
-                                out_buf[b : b + 1, t0:t1, 0].permute(0, 2, 1, 3),
-                                non_blocking=True,
-                            )
-                            local_v[b : b + 1, :, off + t0 : off + t1].copy_(
-                                out_buf[b : b + 1, t0:t1, 1].permute(0, 2, 1, 3),
-                                non_blocking=True,
-                            )
-                else:
-                    mid_k_hsd = out_buf[:, :, 0].permute(0, 2, 1, 3)
-                    mid_v_hsd = out_buf[:, :, 1].permute(0, 2, 1, 3)
-                    local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
-                    local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
+                mid_k_hsd = out_buf[:, :, 0].permute(0, 2, 1, 3)
+                mid_v_hsd = out_buf[:, :, 1].permute(0, 2, 1, 3)
+                local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
+                local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
                 self.local_mid_ready[self.pending_idx] = True
             if self.page_kv_buf[self.pending_idx] is not None:
                 self._sync_sink_to_page_buffers()
                 pbuf = self.page_kv_buf[self.pending_idx]
                 offp = self.n_sink_pages
-                if used_cuda_inplace_delta and prev_active_starts is not None:
-                    changed = starts_cpu.ne(prev_active_starts)
-                    if bool(changed.any()):
-                        idxs = torch.nonzero(changed, as_tuple=False)
-                        for bt in idxs:
-                            b = int(bt[0].item())
-                            p = int(bt[1].item())
-                            t0 = p * self.page_size
-                            t1 = t0 + self.page_size
-                            pbuf[b : b + 1, offp + p : offp + p + 1, 0].copy_(
-                                out_buf[b : b + 1, t0:t1, 0].view(
-                                    1, 1, self.page_size, self.n_kv_heads, self.head_dim
-                                ),
-                                non_blocking=True,
-                            )
-                            pbuf[b : b + 1, offp + p : offp + p + 1, 1].copy_(
-                                out_buf[b : b + 1, t0:t1, 1].view(
-                                    1, 1, self.page_size, self.n_kv_heads, self.head_dim
-                                ),
-                                non_blocking=True,
-                            )
-                else:
-                    mid_pages_k = out_buf[:, :, 0].view(
-                        self.eff_batch,
-                        self.mid_pages,
-                        self.page_size,
-                        self.n_kv_heads,
-                        self.head_dim,
-                    )
-                    mid_pages_v = out_buf[:, :, 1].view(
-                        self.eff_batch,
-                        self.mid_pages,
-                        self.page_size,
-                        self.n_kv_heads,
-                        self.head_dim,
-                    )
-                    pbuf[:, offp : offp + self.mid_pages, 0].copy_(mid_pages_k, non_blocking=True)
-                    pbuf[:, offp : offp + self.mid_pages, 1].copy_(mid_pages_v, non_blocking=True)
+                mid_pages_k = out_buf[:, :, 0].view(
+                    self.eff_batch,
+                    self.mid_pages,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                )
+                mid_pages_v = out_buf[:, :, 1].view(
+                    self.eff_batch,
+                    self.mid_pages,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                )
+                pbuf[:, offp : offp + self.mid_pages, 0].copy_(mid_pages_k, non_blocking=True)
+                pbuf[:, offp : offp + self.mid_pages, 1].copy_(mid_pages_v, non_blocking=True)
                 self.page_mid_ready[self.pending_idx] = True
             self.prefetch_event.record(self.recall_stream)
 
@@ -1906,6 +1904,198 @@ class EchoTokenPrefetchRuntime:
             self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
             self.cpu_len + 1,
         )
+        return scores
+
+    def qk_select_and_cache_scores_stream_prefetch(
+        self,
+        q: torch.Tensor,         # [bsz, 1, n_qo_heads, head_dim]
+        local_k: torch.Tensor,   # [eff/bsz, n_kv_heads, s, head_dim]
+        target_seq_len: int,
+    ) -> Optional[torch.Tensor]:
+        # Stream-overlap path:
+        # - chunked middle QK
+        # - update anchors per chunk
+        # - immediately launch partial recall for next step on recall stream
+        if (not self.use_triton_flash_attn) or self.mid_pages <= 0:
+            return None
+        if self.active_starts is None:
+            return None
+        if not self.allow_anchor_overlap:
+            # Non-overlap starts require global ordering across pages, which breaks chunk-level recall.
+            return None
+        if not self.use_cuda_token_recall:
+            return None
+
+        has_delta_partial = hasattr(kernels, "recall_tokens_delta_linear_partial")
+        has_linear_partial = hasattr(kernels, "recall_tokens_linear_partial")
+        if (not has_delta_partial) and (not has_linear_partial):
+            return None
+
+        bsz = q.shape[0]
+        if local_k.shape[0] != bsz:
+            q_use = q[:1]
+        else:
+            q_use = q
+        q_compact = q_use[:, 0].contiguous()  # [eff, n_qo_heads, head_dim]
+        eff = q_compact.shape[0]
+        seq_len = int(local_k.shape[2])
+        if seq_len <= 0:
+            return None
+
+        bounds = self.middle_bounds(int(target_seq_len))
+        if bounds is None:
+            return None
+        lower, upper = bounds
+        max_start = upper - self.page_size
+        if max_start < lower:
+            return None
+
+        scores = torch.full(
+            (eff, self.n_qo_heads, self.local_total_cap),
+            -float("inf"),
+            dtype=torch.float32,
+            device=q_compact.device,
+        )
+        q_group_f32 = q_compact.view(
+            eff, self.n_kv_heads, self.n_q_per_kv, self.head_dim
+        ).to(dtype=torch.float32)
+
+        # Fill sink segment scores first (no recall dependency).
+        self._fill_qk_scores_segment(scores, q_group_f32, local_k, 0, self.sink_len)
+
+        starts_full = self.active_starts.to(
+            device=torch.device("cpu"), dtype=torch.int32
+        ).clone()
+        local_best_full = torch.empty(
+            (eff, self.mid_pages), dtype=torch.int32, device=torch.device("cpu")
+        )
+
+        pending_idx = 1 - self.active_idx
+        out_buf = self.gpu_mid[pending_idx]
+        starts_dev = starts_full
+        prev_starts_dev = self.active_starts
+
+        chunk_pages = int(max(1, min(self.stream_chunk_pages, self.mid_pages)))
+        for p0 in range(0, self.mid_pages, chunk_pages):
+            p_count = int(min(chunk_pages, self.mid_pages - p0))
+            tok_begin = int(self.sink_len + p0 * self.page_size)
+            tok_end = int(tok_begin + p_count * self.page_size)
+
+            chunk_scores, qh_best = _triton_flash_decode_qk_select(
+                q_compact,
+                local_k[:, :, tok_begin:tok_end],
+                n_q_per_kv=self.n_q_per_kv,
+                page_size=self.page_size,
+                mid_start=0,
+                mid_pages=p_count,
+                max_tokens=p_count * self.page_size,
+            )
+            if chunk_scores is None or qh_best is None:
+                return None
+            scores[:, :, tok_begin:tok_end].copy_(chunk_scores, non_blocking=True)
+
+            local_best_chunk = qh_best.view(
+                eff, self.n_kv_heads, self.n_q_per_kv, p_count
+            ).float().mean(dim=(1, 2)).round().to(torch.int32)
+            local_best_chunk_cpu = local_best_chunk.to(
+                device=torch.device("cpu"), dtype=torch.int32
+            )
+            local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
+
+            starts_chunk = self.active_starts[:, p0 : p0 + p_count] + local_best_chunk_cpu
+            starts_chunk = torch.clamp(
+                starts_chunk - int(self.slide_half_window),
+                min=lower,
+                max=max_start,
+            ).to(dtype=torch.int32)
+            starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
+
+            with torch.cuda.stream(self.recall_stream):
+                if has_delta_partial and self.active_starts is not None:
+                    kernels.recall_tokens_delta_linear_partial(
+                        starts_dev,
+                        prev_starts_dev,
+                        self.cpu_kv[: self.eff_batch],
+                        self.gpu_mid[self.active_idx],
+                        out_buf,
+                        self.cpu_len,
+                        p0,
+                        p_count,
+                    )
+                elif has_linear_partial:
+                    kernels.recall_tokens_linear_partial(
+                        starts_dev,
+                        self.cpu_kv[: self.eff_batch],
+                        out_buf,
+                        self.cpu_len,
+                        p0,
+                        p_count,
+                    )
+                else:
+                    self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
+
+        # Fill window segment scores after middle chunk loop.
+        self._fill_qk_scores_segment(
+            scores,
+            q_group_f32,
+            local_k,
+            self.sink_len + self.mid_tokens,
+            seq_len,
+        )
+
+        anchors = (self.active_starts + local_best_full).to(
+            device=torch.device("cpu"), dtype=torch.int32
+        ).contiguous()
+        self.anchors = anchors
+        self._set_prefetch_hint(starts_full, int(target_seq_len))
+
+        with torch.cuda.stream(self.recall_stream):
+            self.pending_idx = pending_idx
+            self.local_mid_ready[pending_idx] = False
+            self.page_mid_ready[pending_idx] = False
+            if self.local_k_buf[pending_idx] is not None:
+                local_k_dst = self.local_k_buf[pending_idx]
+                local_v_dst = self.local_v_buf[pending_idx]
+                off = self.sink_len
+                mid_k_hsd = out_buf[:, :, 0].permute(0, 2, 1, 3)
+                mid_v_hsd = out_buf[:, :, 1].permute(0, 2, 1, 3)
+                local_k_dst[:, :, off : off + self.mid_tokens].copy_(
+                    mid_k_hsd, non_blocking=True
+                )
+                local_v_dst[:, :, off : off + self.mid_tokens].copy_(
+                    mid_v_hsd, non_blocking=True
+                )
+                self.local_mid_ready[pending_idx] = True
+            if self.page_kv_buf[pending_idx] is not None:
+                self._sync_sink_to_page_buffers()
+                pbuf = self.page_kv_buf[pending_idx]
+                offp = self.n_sink_pages
+                mid_pages_k = out_buf[:, :, 0].view(
+                    self.eff_batch,
+                    self.mid_pages,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                )
+                mid_pages_v = out_buf[:, :, 1].view(
+                    self.eff_batch,
+                    self.mid_pages,
+                    self.page_size,
+                    self.n_kv_heads,
+                    self.head_dim,
+                )
+                pbuf[:, offp : offp + self.mid_pages, 0].copy_(
+                    mid_pages_k, non_blocking=True
+                )
+                pbuf[:, offp : offp + self.mid_pages, 1].copy_(
+                    mid_pages_v, non_blocking=True
+                )
+                self.page_mid_ready[pending_idx] = True
+            self.prefetch_event.record(self.recall_stream)
+
+        self.pending_seq_len = int(target_seq_len)
+        self.pending_starts = starts_full
+        self.prefetch_ready = True
         return scores
 
     def pv_from_score_cache(

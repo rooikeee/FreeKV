@@ -252,6 +252,24 @@ void recall_tokens_delta_linear(
     torch::Tensor gpu_mid_kv,               // [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
     int64_t valid_tokens
 );
+void recall_tokens_linear_partial(
+    const torch::Tensor &token_starts,    // [bsz or 1, n_pages], int32
+    const torch::Tensor &cpu_kv_linear,   // [bsz, max_tokens, 2, n_kv_heads, head_dim], pinned cpu
+    torch::Tensor gpu_mid_kv,             // [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    int64_t valid_tokens,
+    int64_t page_begin,
+    int64_t page_count
+);
+void recall_tokens_delta_linear_partial(
+    const torch::Tensor &token_starts,      // [bsz or 1, n_pages], int32
+    const torch::Tensor &prev_token_starts, // [bsz or 1, n_pages], int32
+    const torch::Tensor &cpu_kv_linear,     // [bsz, max_tokens, 2, n_kv_heads, head_dim], pinned cpu
+    const torch::Tensor &gpu_prev_mid_kv,   // [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    torch::Tensor gpu_mid_kv,               // [bsz, n_pages*page_size, 2, n_kv_heads, head_dim]
+    int64_t valid_tokens,
+    int64_t page_begin,
+    int64_t page_count
+);
 void init_recall_thread_pool(int num_threads);
 void shutdown_recall_thread_pool();
 
