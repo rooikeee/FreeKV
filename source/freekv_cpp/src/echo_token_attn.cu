@@ -40,6 +40,20 @@ __device__ inline float block_reduce_sum(float v) {
 }
 
 template <int THREADS>
+__device__ inline int block_reduce_sum_int(int v) {
+  __shared__ int smem[THREADS];
+  smem[threadIdx.x] = v;
+  __syncthreads();
+  for (int s = THREADS / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      smem[threadIdx.x] += smem[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  return smem[0];
+}
+
+template <int THREADS>
 __device__ inline float block_reduce_max(float v) {
   __shared__ float smem[THREADS];
   smem[threadIdx.x] = v;
@@ -163,6 +177,34 @@ __global__ void echo_qk_pagemax_chunk_only_kernel(
 
   if (threadIdx.x == 0) {
     out_best_ptr[b * stride_o_b + qh * stride_o_h + p * stride_o_p] = s_best_i[0];
+  }
+}
+
+template <int THREADS>
+__global__ void echo_reduce_qh_best_mean_kernel(
+    const int32_t* __restrict__ in_best_ptr,   // [b, hq, p]
+    int32_t* __restrict__ out_best_ptr,        // [b, p]
+    int64_t stride_i_b,
+    int64_t stride_i_h,
+    int64_t stride_i_p,
+    int64_t stride_o_b,
+    int64_t stride_o_p,
+    int64_t n_q_heads,
+    int64_t page_count) {
+  const int64_t linear = static_cast<int64_t>(blockIdx.x);
+  const int64_t p = linear % page_count;
+  const int64_t b = linear / page_count;
+
+  int local_sum = 0;
+  for (int64_t qh = threadIdx.x; qh < n_q_heads; qh += THREADS) {
+    local_sum += static_cast<int>(
+        in_best_ptr[b * stride_i_b + qh * stride_i_h + p * stride_i_p]);
+  }
+  const int sum = block_reduce_sum_int<THREADS>(local_sum);
+  if (threadIdx.x == 0) {
+    const int rounded_mean = (sum + static_cast<int>(n_q_heads / 2)) /
+                             static_cast<int>(n_q_heads);
+    out_best_ptr[b * stride_o_b + p * stride_o_p] = static_cast<int32_t>(rounded_mean);
   }
 }
 
@@ -455,6 +497,41 @@ torch::Tensor echo_decode_qk_pagemax_chunk_only(
   TORCH_CHECK(
       err == cudaSuccess,
       "echo_qk_pagemax_chunk_only_kernel launch failed: ",
+      cudaGetErrorString(err));
+  return out_best;
+}
+
+torch::Tensor echo_decode_qk_pagemax_chunk_only_reduced(
+    const torch::Tensor &q,
+    const torch::Tensor &k,
+    int64_t n_q_per_kv,
+    int64_t token_begin,
+    int64_t page_size,
+    int64_t page_count) {
+  auto out_qh = echo_decode_qk_pagemax_chunk_only(
+      q, k, n_q_per_kv, token_begin, page_size, page_count);
+  auto out_best = torch::empty(
+      {q.size(0), page_count},
+      torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
+
+  constexpr int THREADS = 128;
+  const int64_t total = q.size(0) * page_count;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  echo_reduce_qh_best_mean_kernel<THREADS>
+      <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
+          out_qh.data_ptr<int32_t>(),
+          out_best.data_ptr<int32_t>(),
+          out_qh.stride(0),
+          out_qh.stride(1),
+          out_qh.stride(2),
+          out_best.stride(0),
+          out_best.stride(1),
+          q.size(1),
+          page_count);
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(
+      err == cudaSuccess,
+      "echo_reduce_qh_best_mean_kernel launch failed: ",
       cudaGetErrorString(err));
   return out_best;
 }

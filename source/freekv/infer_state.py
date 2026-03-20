@@ -309,7 +309,12 @@ class InferState:
                 budget = self.layer2budget[i]
                 if budget is None:
                     continue
-                mid_pages = max(0, self.layer2topk[i] or 0)
+                # EchoKV mid-region recall pages are budget-derived and exclude
+                # sink/recent pages that should stay resident on GPU.
+                mid_pages = max(
+                    0,
+                    int(budget) - int(self.n_sink_pages) - int(self.n_win_pages),
+                )
                 enable_page_kv = self.echo_attn_backend == "flashinfer"
                 enable_local_kv = not enable_page_kv
                 self.echo_runtimes[i] = EchoTokenPrefetchRuntime(
@@ -852,23 +857,19 @@ class InferState:
                 self._perf_stop("pack", pack_t0)
 
                 stream_prefetch_ready = False
-                attn_t0 = self._perf_start("attn")
                 if rt.stream_prefetch_only:
-                    out = rt.attend_flash_attn(
-                        q,
-                        local_k,
-                        local_v,
-                        strict=False,
-                    )
-                    self._perf_stop("attn", attn_t0)
-
+                    # Launch next-step chunk prefetch first so it can overlap with
+                    # current-step flash attention on another stream.
                     rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
                     stream_prefetch_ready = rt.select_and_prefetch_stream_only(
                         q,
                         local_k,
                         target_seq_len=cur_seq + 1,
-                        allow_inplace_delta=True,
+                        # Overlap mode must avoid writing active buffer while
+                        # current-step attention is reading it.
+                        allow_inplace_delta=False,
                     )
+                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
                     if (not stream_prefetch_ready):
                         if self.echo_require_triton_flash:
                             raise RuntimeError(
@@ -876,15 +877,26 @@ class InferState:
                                 "which means chunk-level CUDA page-max + partial recall "
                                 "did not run."
                             )
+                    attn_t0 = self._perf_start("attn")
+                    out = rt.attend_flash_attn(
+                        q,
+                        local_k,
+                        local_v,
+                        strict=False,
+                    )
+                    self._perf_stop("attn", attn_t0)
+                    if not stream_prefetch_ready:
                         next_starts = rt.build_starts(cur_seq + 1)
                         if next_starts is not None:
+                            rec_t2 = self._perf_start("recall", stream=rt.recall_stream)
                             rt.launch_prefetch(
                                 next_starts,
                                 target_seq_len=cur_seq + 1,
                                 allow_inplace_delta=True,
                             )
-                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+                            self._perf_stop("recall", rec_t2, stream=rt.recall_stream)
                 else:
+                    attn_t0 = self._perf_start("attn")
                     score_cache = None
                     sel_t0 = self._perf_start("select")
                     score_cache = rt.qk_select_and_cache_scores_stream_prefetch(

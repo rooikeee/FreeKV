@@ -172,9 +172,12 @@ def load_model_and_tokenizer(path):
     page_budgets = token_budgets // page_size
     n_sink_pages = args.sink // page_size
     n_win_pages = args.recent // page_size
+    echo_anchor_pages = max(0, page_budgets - n_sink_pages - n_win_pages)
+    echo_anchor_tokens = echo_anchor_pages * page_size
     print(f"\n{CYAN}{SEP}")
     print(f"  KV Cache Config: token_budget={token_budgets}, page_budget={page_budgets}, "
-          f"page_size={page_size}, sink={args.sink}, recent={args.recent}")
+          f"page_size={page_size}, sink={args.sink}, recent={args.recent}, "
+          f"echo_anchor_pages={echo_anchor_pages}, echo_anchor_tokens={echo_anchor_tokens}")
     print(f"  Echo Config: sel_policy={args.sel_policy}, seed_anchors={args.echo_num_anchors}, "
           f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}, "
           f"attn_backend={args.echo_attn_backend}, "

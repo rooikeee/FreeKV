@@ -2199,8 +2199,15 @@ class EchoTokenPrefetchRuntime:
         if (not has_delta_partial) and (not has_linear_partial):
             return False
 
+        has_cuda_pagemax_only_reduced = hasattr(
+            kernels, "echo_decode_qk_pagemax_chunk_only_reduced"
+        )
         has_cuda_pagemax_only = hasattr(kernels, "echo_decode_qk_pagemax_chunk_only")
-        if (not has_cuda_pagemax_only) and (not self.use_triton_flash_attn):
+        if (
+            (not has_cuda_pagemax_only_reduced)
+            and (not has_cuda_pagemax_only)
+            and (not self.use_triton_flash_attn)
+        ):
             return False
 
         bsz = q.shape[0]
@@ -2238,8 +2245,21 @@ class EchoTokenPrefetchRuntime:
                 tok_begin = int(self.sink_len + p0 * self.page_size)
                 tok_end = int(tok_begin + p_count * self.page_size)
 
+                local_best_chunk = None
                 qh_best = None
-                if has_cuda_pagemax_only:
+                if has_cuda_pagemax_only_reduced:
+                    try:
+                        local_best_chunk = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
+                            q_compact,
+                            local_k,
+                            self.n_q_per_kv,
+                            tok_begin,
+                            self.page_size,
+                            p_count,
+                        )
+                    except Exception:
+                        local_best_chunk = None
+                if local_best_chunk is None and has_cuda_pagemax_only:
                     try:
                         qh_best = kernels.echo_decode_qk_pagemax_chunk_only(
                             q_compact,
@@ -2252,7 +2272,7 @@ class EchoTokenPrefetchRuntime:
                     except Exception:
                         qh_best = None
 
-                if qh_best is None:
+                if local_best_chunk is None and qh_best is None:
                     chunk_scores, qh_best = _triton_flash_decode_qk_select(
                         q_compact,
                         local_k[:, :, tok_begin:tok_end],
@@ -2265,9 +2285,10 @@ class EchoTokenPrefetchRuntime:
                     if chunk_scores is None or qh_best is None:
                         return False
 
-                local_best_chunk = qh_best.view(
-                    eff, self.n_kv_heads, self.n_q_per_kv, p_count
-                ).float().mean(dim=(1, 2)).round().to(torch.int32)
+                if local_best_chunk is None:
+                    local_best_chunk = qh_best.view(
+                        eff, self.n_kv_heads, self.n_q_per_kv, p_count
+                    ).float().mean(dim=(1, 2)).round().to(torch.int32)
                 local_best_chunk_cpu = local_best_chunk.to(
                     device=torch.device("cpu"), dtype=torch.int32
                 )

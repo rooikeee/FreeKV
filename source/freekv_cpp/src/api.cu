@@ -36,6 +36,7 @@ PYBIND11_MODULE(freekv_cpp, m) {
 	m.def("echo_decode_qk_scores_chunk", &echo_decode_qk_scores_chunk);
 	m.def("echo_decode_qk_scores_pagemax_chunk", &echo_decode_qk_scores_pagemax_chunk);
 	m.def("echo_decode_qk_pagemax_chunk_only", &echo_decode_qk_pagemax_chunk_only);
+	m.def("echo_decode_qk_pagemax_chunk_only_reduced", &echo_decode_qk_pagemax_chunk_only_reduced);
 	m.def("echo_decode_pv_from_scores_cuda", &echo_decode_pv_from_scores_cuda);
 	m.def("init_recall_thread_pool", &init_recall_thread_pool);
 	m.def("shutdown_recall_thread_pool", &shutdown_recall_thread_pool);
