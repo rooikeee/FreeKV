@@ -98,6 +98,74 @@ __global__ void echo_qk_scores_chunk_kernel(
   }
 }
 
+template <typename scalar_t, int THREADS>
+__global__ void echo_qk_pagemax_chunk_only_kernel(
+    const scalar_t* __restrict__ q_ptr,      // [b, hq, d]
+    const scalar_t* __restrict__ k_ptr,      // [b, hk, s, d]
+    int32_t* __restrict__ out_best_ptr,      // [b, hq, page_count]
+    int64_t stride_q_b,
+    int64_t stride_q_h,
+    int64_t stride_q_d,
+    int64_t stride_k_b,
+    int64_t stride_k_h,
+    int64_t stride_k_t,
+    int64_t stride_k_d,
+    int64_t stride_o_b,
+    int64_t stride_o_h,
+    int64_t stride_o_p,
+    int64_t n_q_heads,
+    int64_t n_q_per_kv,
+    int64_t head_dim,
+    int64_t token_begin,
+    int64_t page_size,
+    int64_t page_count) {
+  int64_t linear = static_cast<int64_t>(blockIdx.x);
+  const int64_t p = linear % page_count;
+  linear /= page_count;
+  const int64_t qh = linear % n_q_heads;
+  const int64_t b = linear / n_q_heads;
+  const int64_t kvh = qh / n_q_per_kv;
+
+  const int64_t tok_local = static_cast<int64_t>(threadIdx.x);
+  float score = -FLT_MAX;
+  int32_t idx = static_cast<int32_t>(tok_local);
+  if (tok_local < page_size) {
+    const int64_t tok = token_begin + p * page_size + tok_local;
+    const scalar_t* q_base = q_ptr + b * stride_q_b + qh * stride_q_h;
+    const scalar_t* k_base = k_ptr + b * stride_k_b + kvh * stride_k_h + tok * stride_k_t;
+    float acc = 0.0f;
+    for (int64_t d = 0; d < head_dim; ++d) {
+      const float qv = scalar_to_float<scalar_t>(q_base[d * stride_q_d]);
+      const float kv = scalar_to_float<scalar_t>(k_base[d * stride_k_d]);
+      acc += qv * kv;
+    }
+    score = acc;
+  }
+
+  __shared__ float s_best_v[THREADS];
+  __shared__ int32_t s_best_i[THREADS];
+  s_best_v[threadIdx.x] = score;
+  s_best_i[threadIdx.x] = idx;
+  __syncthreads();
+
+  for (int s = THREADS / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      const float ov = s_best_v[threadIdx.x + s];
+      const int32_t oi = s_best_i[threadIdx.x + s];
+      if ((ov > s_best_v[threadIdx.x]) ||
+          ((ov == s_best_v[threadIdx.x]) && (oi < s_best_i[threadIdx.x]))) {
+        s_best_v[threadIdx.x] = ov;
+        s_best_i[threadIdx.x] = oi;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    out_best_ptr[b * stride_o_b + qh * stride_o_h + p * stride_o_p] = s_best_i[0];
+  }
+}
+
 template <int THREADS>
 __global__ void echo_page_argmax_from_scores_kernel(
     const float* __restrict__ scores_ptr,    // [b, hq, max_t]
@@ -261,9 +329,9 @@ void echo_decode_qk_scores_chunk(
     int64_t n_q_per_kv,
     int64_t token_begin,
     int64_t token_count) {
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(scores);
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  CHECK_CUDA(scores);
   TORCH_CHECK(q.dim() == 3, "q must be [bsz, n_q_heads, head_dim]");
   TORCH_CHECK(k.dim() == 4, "k must be [bsz, n_kv_heads, seq_len, head_dim]");
   TORCH_CHECK(scores.dim() == 3, "scores must be [bsz, n_q_heads, max_tokens]");
@@ -329,13 +397,75 @@ torch::Tensor echo_decode_qk_scores_pagemax_chunk(
   return out_best;
 }
 
+torch::Tensor echo_decode_qk_pagemax_chunk_only(
+    const torch::Tensor &q,
+    const torch::Tensor &k,
+    int64_t n_q_per_kv,
+    int64_t token_begin,
+    int64_t page_size,
+    int64_t page_count) {
+  CHECK_CUDA(q);
+  CHECK_CUDA(k);
+  TORCH_CHECK(q.dim() == 3, "q must be [bsz, n_q_heads, head_dim]");
+  TORCH_CHECK(k.dim() == 4, "k must be [bsz, n_kv_heads, seq_len, head_dim]");
+  TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q/k dtype mismatch");
+  TORCH_CHECK(n_q_per_kv > 0, "n_q_per_kv must be > 0");
+  TORCH_CHECK((q.size(1) % n_q_per_kv) == 0, "n_q_heads must be divisible by n_q_per_kv");
+  TORCH_CHECK((q.size(1) / n_q_per_kv) == k.size(1), "k n_kv_heads mismatch");
+  TORCH_CHECK(q.size(2) == k.size(3), "q/k head_dim mismatch");
+  TORCH_CHECK(page_size > 0 && page_size <= 128, "page_size must be in [1, 128]");
+  TORCH_CHECK(page_count > 0, "page_count must be > 0");
+  TORCH_CHECK(token_begin >= 0, "token_begin must be >= 0");
+  TORCH_CHECK(
+      token_begin + page_size * page_count <= k.size(2),
+      "chunk exceeds k seq_len");
+
+  auto out_best = torch::empty(
+      {q.size(0), q.size(1), page_count},
+      torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
+  constexpr int THREADS = 128;
+  const int64_t total = q.size(0) * q.size(1) * page_count;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
+    echo_qk_pagemax_chunk_only_kernel<c_type, THREADS>
+        <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
+            reinterpret_cast<const c_type*>(q.data_ptr()),
+            reinterpret_cast<const c_type*>(k.data_ptr()),
+            out_best.data_ptr<int32_t>(),
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            k.stride(3),
+            out_best.stride(0),
+            out_best.stride(1),
+            out_best.stride(2),
+            q.size(1),
+            n_q_per_kv,
+            q.size(2),
+            token_begin,
+            page_size,
+            page_count);
+    return true;
+  });
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(
+      err == cudaSuccess,
+      "echo_qk_pagemax_chunk_only_kernel launch failed: ",
+      cudaGetErrorString(err));
+  return out_best;
+}
+
 torch::Tensor echo_decode_pv_from_scores_cuda(
     const torch::Tensor &scores,
     const torch::Tensor &v,
     int64_t n_q_per_kv,
     int64_t seq_len) {
-  CHECK_INPUT(scores);
-  CHECK_INPUT(v);
+  CHECK_CUDA(scores);
+  CHECK_CUDA(v);
   TORCH_CHECK(scores.dim() == 3, "scores must be [bsz, n_q_heads, max_tokens]");
   TORCH_CHECK(v.dim() == 4, "v must be [bsz, n_kv_heads, seq_len, head_dim]");
   TORCH_CHECK(scores.scalar_type() == torch::kFloat32, "scores must be float32");

@@ -120,8 +120,10 @@ def parse_args(args=None):
                         help="Number of seed anchors for EchoKV-token")
     parser.add_argument("--echo_anchor_head_sample", type=int, default=0,
                         help="Sampled KV heads for anchor scoring (0=all heads)")
-    parser.add_argument("--echo_stream_chunk_pages", type=int, default=4,
+    parser.add_argument("--echo_stream_chunk_pages", type=int, default=16,
                         help="Chunk size (pages) for stream-overlap QK->partial-recall path")
+    parser.add_argument("--echo_disable_stream_prefetch_only", action="store_true",
+                        help="Disable fast stream mode (selection-only + flash-attn output) and use score-cache split path")
     parser.add_argument("--echo_attn_backend", type=str, default="sdpa",
                         choices=["sdpa", "flashinfer", "flash_attn"],
                         help="Attention backend for EchoKV-token decode")
@@ -176,6 +178,7 @@ def load_model_and_tokenizer(path):
           f"attn_backend={args.echo_attn_backend}, "
           f"flash_mode={args.echo_flash_mode}, "
           f"stream_chunk_pages={args.echo_stream_chunk_pages}, "
+          f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
           f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
@@ -205,6 +208,7 @@ def load_model_and_tokenizer(path):
             echo_attn_backend=args.echo_attn_backend,
             echo_flash_mode=args.echo_flash_mode,
             echo_stream_chunk_pages=args.echo_stream_chunk_pages,
+            echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
             echo_shared_batch=args.echo_shared_batch,
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             echo_use_triton_qk_select=(not args.echo_disable_triton_qk_select),

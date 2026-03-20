@@ -196,12 +196,15 @@ class InferState:
             kwargs.get("echo_allow_anchor_overlap", True)
         )
         self.echo_prefer_flash_attn_package = bool(
-            kwargs.get("echo_prefer_flash_attn_package", False)
+            kwargs.get("echo_prefer_flash_attn_package", True)
         )
         self.echo_require_triton_flash = bool(
             kwargs.get("echo_require_triton_flash", True)
         )
-        self.echo_stream_chunk_pages = int(kwargs.get("echo_stream_chunk_pages", 4))
+        self.echo_stream_chunk_pages = int(kwargs.get("echo_stream_chunk_pages", 16))
+        self.echo_stream_prefetch_only = bool(
+            kwargs.get("echo_stream_prefetch_only", True)
+        )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "sdpa")).lower()
         self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "fused_fast")).lower()
@@ -310,6 +313,7 @@ class InferState:
                     enable_local_kv=enable_local_kv,
                     enable_page_kv=enable_page_kv,
                     stream_chunk_pages=self.echo_stream_chunk_pages,
+                    stream_prefetch_only=self.echo_stream_prefetch_only,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -780,20 +784,46 @@ class InferState:
                 local_k, local_v, _ = rt.local_kv(q.shape[0])
                 self._perf_stop("pack", pack_t0)
 
+                stream_prefetch_ready = False
+                score_cache = None
+
                 sel_t0 = self._perf_start("select")
-                score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
-                    q,
-                    local_k,
-                    target_seq_len=cur_seq + 1,
-                )
-                stream_prefetch_ready = score_cache is not None
-                if score_cache is None:
-                    score_cache = rt.qk_select_and_cache_scores(q, local_k)
+                if rt.stream_prefetch_only:
+                    stream_prefetch_ready = rt.select_and_prefetch_stream_only(
+                        q,
+                        local_k,
+                        target_seq_len=cur_seq + 1,
+                    )
+                    if (not stream_prefetch_ready):
+                        if self.echo_require_triton_flash:
+                            raise RuntimeError(
+                                "echo stream_prefetch_only path is unavailable, "
+                                "which means chunk-level CUDA page-max + partial recall "
+                                "did not run. Disable strict mode or disable stream_prefetch_only."
+                            )
+                        score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
+                            q,
+                            local_k,
+                            target_seq_len=cur_seq + 1,
+                        )
+                        stream_prefetch_ready = score_cache is not None
+                        if score_cache is None:
+                            score_cache = rt.qk_select_and_cache_scores(q, local_k)
+                else:
+                    score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
+                        q,
+                        local_k,
+                        target_seq_len=cur_seq + 1,
+                    )
+                    stream_prefetch_ready = score_cache is not None
+                    if score_cache is None:
+                        score_cache = rt.qk_select_and_cache_scores(q, local_k)
                 self._perf_stop("select", sel_t0)
-                if score_cache is None:
+
+                if (not stream_prefetch_ready) and score_cache is None:
                     if self.echo_require_triton_flash:
                         raise RuntimeError(
-                            "echo_attn_backend=flash_attn requires Triton QK-select stage, "
+                            "echo_attn_backend=flash_attn requires QK-select stage, "
                             "but stage-1 returned None."
                         )
                     sel_fb_t0 = self._perf_start("select")
@@ -812,19 +842,27 @@ class InferState:
                         self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
                 attn_t0 = self._perf_start("attn")
-                out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
-                if out is None:
-                    if self.echo_require_triton_flash:
-                        raise RuntimeError(
-                            "echo_attn_backend=flash_attn requires Triton P@V stage, "
-                            "but stage-2 returned None."
-                        )
+                if rt.stream_prefetch_only:
                     out = rt.attend_flash_attn(
                         q,
                         local_k,
                         local_v,
                         strict=False,
                     )
+                else:
+                    out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
+                    if out is None:
+                        if self.echo_require_triton_flash:
+                            raise RuntimeError(
+                                "echo_attn_backend=flash_attn requires Triton P@V stage, "
+                                "but stage-2 returned None."
+                            )
+                        out = rt.attend_flash_attn(
+                            q,
+                            local_k,
+                            local_v,
+                            strict=False,
+                        )
                 self._perf_stop("attn", attn_t0)
             else:
                 # Fast path: single fused attention kernel with page argmax.

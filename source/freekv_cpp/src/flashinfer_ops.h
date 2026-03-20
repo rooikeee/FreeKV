@@ -290,6 +290,15 @@ torch::Tensor echo_decode_qk_scores_pagemax_chunk(
     int64_t page_count
 ); // returns [bsz, n_q_heads, page_count], int32
 
+torch::Tensor echo_decode_qk_pagemax_chunk_only(
+    const torch::Tensor &q,      // [bsz, n_q_heads, head_dim], cuda half/bf16
+    const torch::Tensor &k,      // [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16
+    int64_t n_q_per_kv,
+    int64_t token_begin,
+    int64_t page_size,
+    int64_t page_count
+); // returns [bsz, n_q_heads, page_count], int32
+
 torch::Tensor echo_decode_pv_from_scores_cuda(
     const torch::Tensor &scores, // [bsz, n_q_heads, max_tokens], cuda float32
     const torch::Tensor &v,      // [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16
