@@ -203,10 +203,12 @@ class InferState:
         )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "sdpa")).lower()
+        self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "fused_fast")).lower()
         self.profile_timing = bool(kwargs.get("profile_timing", True))
         assert self.echo_num_anchors > 0
         assert self.echo_anchor_head_sample >= 0
         assert self.echo_attn_backend in ("sdpa", "flashinfer", "flash_attn")
+        assert self.echo_flash_mode in ("fused_fast", "split_overlap")
 
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
@@ -286,6 +288,8 @@ class InferState:
                 if budget is None:
                     continue
                 mid_pages = max(0, self.layer2topk[i] or 0)
+                enable_page_kv = self.echo_attn_backend == "flashinfer"
+                enable_local_kv = not enable_page_kv
                 self.echo_runtimes[i] = EchoTokenPrefetchRuntime(
                     n_qo_heads=self.n_qo_heads,
                     n_kv_heads=self.n_kv_heads,
@@ -302,6 +306,8 @@ class InferState:
                     use_triton_flash_attn=self.echo_use_triton_flash_attn,
                     allow_anchor_overlap=self.echo_allow_anchor_overlap,
                     prefer_flash_attn_package=self.echo_prefer_flash_attn_package,
+                    enable_local_kv=enable_local_kv,
+                    enable_page_kv=enable_page_kv,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -764,52 +770,77 @@ class InferState:
                 out = handler.forward(q, page_kv, page_ids)
             self._perf_stop("attn", attn_t0)
         elif self.echo_attn_backend == "flash_attn":
-            # Modified Triton flash-attn path:
-            # stage-1: QK + page-argmax anchors
-            # stage-2: launch next recall immediately
-            # stage-3: P@V from stage-1 score cache (no extra QK)
-            pack_t0 = self._perf_start("pack")
-            local_k, local_v, _ = rt.local_kv(q.shape[0])
-            self._perf_stop("pack", pack_t0)
+            if self.echo_flash_mode == "split_overlap":
+                # stage-1: QK + page-argmax anchors
+                # stage-2: launch next recall immediately
+                # stage-3: P@V from stage-1 score cache (no extra QK)
+                pack_t0 = self._perf_start("pack")
+                local_k, local_v, _ = rt.local_kv(q.shape[0])
+                self._perf_stop("pack", pack_t0)
 
-            sel_t0 = self._perf_start("select")
-            score_cache = rt.qk_select_and_cache_scores(q, local_k)
-            self._perf_stop("select", sel_t0)
-            if score_cache is None:
-                if self.echo_require_triton_flash:
-                    raise RuntimeError(
-                        "echo_attn_backend=flash_attn requires Triton QK-select stage, "
-                        "but stage-1 returned None."
+                sel_t0 = self._perf_start("select")
+                score_cache = rt.qk_select_and_cache_scores(q, local_k)
+                self._perf_stop("select", sel_t0)
+                if score_cache is None:
+                    if self.echo_require_triton_flash:
+                        raise RuntimeError(
+                            "echo_attn_backend=flash_attn requires Triton QK-select stage, "
+                            "but stage-1 returned None."
+                        )
+                    sel_fb_t0 = self._perf_start("select")
+                    rt.update_anchors_from_active_mid(q)
+                    self._perf_stop("select", sel_fb_t0)
+
+                next_starts = rt.build_starts(cur_seq + 1)
+                if next_starts is not None:
+                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                    rt.launch_prefetch(
+                        next_starts,
+                        target_seq_len=cur_seq + 1,
+                        allow_inplace_delta=True,
                     )
-                sel_fb_t0 = self._perf_start("select")
-                rt.update_anchors_from_active_mid(q)
-                self._perf_stop("select", sel_fb_t0)
+                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
-            next_starts = rt.build_starts(cur_seq + 1)
-            if next_starts is not None:
-                rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
-                rt.launch_prefetch(
-                    next_starts,
-                    target_seq_len=cur_seq + 1,
-                    allow_inplace_delta=True,
-                )
-                self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
-
-            attn_t0 = self._perf_start("attn")
-            out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
-            if out is None:
-                if self.echo_require_triton_flash:
-                    raise RuntimeError(
-                        "echo_attn_backend=flash_attn requires Triton P@V stage, "
-                        "but stage-2 returned None."
+                attn_t0 = self._perf_start("attn")
+                out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
+                if out is None:
+                    if self.echo_require_triton_flash:
+                        raise RuntimeError(
+                            "echo_attn_backend=flash_attn requires Triton P@V stage, "
+                            "but stage-2 returned None."
+                        )
+                    out = rt.attend_flash_attn(
+                        q,
+                        local_k,
+                        local_v,
+                        strict=False,
                     )
-                out = rt.attend_flash_attn(
-                    q,
-                    local_k,
-                    local_v,
-                    strict=False,
-                )
-            self._perf_stop("attn", attn_t0)
+                self._perf_stop("attn", attn_t0)
+            else:
+                # Fast path: single fused attention kernel with page argmax.
+                # This minimizes decode latency by avoiding split QK/PV score cache.
+                pack_t0 = self._perf_start("pack")
+                local_k, local_v, k_mid = rt.local_kv(q.shape[0])
+                self._perf_stop("pack", pack_t0)
+
+                attn_t0 = self._perf_start("attn")
+                out, fused_select = rt.attend_and_update_anchors_fused(q, local_k, local_v)
+                self._perf_stop("attn", attn_t0)
+
+                if not fused_select:
+                    sel_t0 = self._perf_start("select")
+                    rt.update_anchors_from_middle(q, k_mid)
+                    self._perf_stop("select", sel_t0)
+
+                next_starts = rt.build_starts(cur_seq + 1)
+                if next_starts is not None:
+                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                    rt.launch_prefetch(
+                        next_starts,
+                        target_seq_len=cur_seq + 1,
+                        allow_inplace_delta=True,
+                    )
+                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
         else:
             pack_t0 = self._perf_start("pack")
             local_k, local_v, k_mid = rt.local_kv(q.shape[0])

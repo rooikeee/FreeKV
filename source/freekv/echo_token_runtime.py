@@ -848,6 +848,8 @@ class EchoTokenPrefetchRuntime:
         use_triton_flash_attn: bool = True,
         allow_anchor_overlap: bool = True,
         prefer_flash_attn_package: bool = True,
+        enable_local_kv: bool = True,
+        enable_page_kv: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -865,6 +867,8 @@ class EchoTokenPrefetchRuntime:
         self.use_triton_flash_attn = bool(use_triton_flash_attn and (triton is not None))
         self.allow_anchor_overlap = bool(allow_anchor_overlap)
         self.prefer_flash_attn_package = bool(prefer_flash_attn_package)
+        self.enable_local_kv = bool(enable_local_kv)
+        self.enable_page_kv = bool(enable_page_kv)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -977,7 +981,7 @@ class EchoTokenPrefetchRuntime:
             device=device,
         )
         self.gpu_mid[1] = torch.empty_like(self.gpu_mid[0])
-        if self.local_total_cap > 0:
+        if self.enable_local_kv and self.local_total_cap > 0:
             self.local_k_buf[0] = torch.empty(
                 (eff_bsz, self.n_kv_heads, self.local_total_cap, self.head_dim),
                 dtype=dtype,
@@ -989,7 +993,7 @@ class EchoTokenPrefetchRuntime:
         else:
             self.local_k_buf = [None, None]
             self.local_v_buf = [None, None]
-        if self.local_pages > 0:
+        if self.enable_page_kv and self.local_pages > 0:
             self.page_kv_buf[0] = torch.empty(
                 (
                     eff_bsz,
@@ -1105,6 +1109,7 @@ class EchoTokenPrefetchRuntime:
 
         self._sync_sink_to_local_buffers()
         self._sync_sink_to_page_buffers()
+        self._sync_window_to_local_buffers_full()
         self._sync_window_to_page_buffers_full()
 
     def append_decode_token_to_cpu(
@@ -1140,11 +1145,15 @@ class EchoTokenPrefetchRuntime:
                 self.win_k[:, :, self.win_len : self.win_len + 1].copy_(k_tok_h, non_blocking=True)
                 self.win_v[:, :, self.win_len : self.win_len + 1].copy_(v_tok_h, non_blocking=True)
                 self.win_len += 1
+                self._update_window_token_in_local_buffers(self.win_len - 1, k_tok_h, v_tok_h)
+                if self.win_len == self.win_tokens:
+                    self._sync_window_to_local_buffers_full()
                 self._sync_window_to_page_buffers_full()
             else:
                 write_slot = self.win_ptr
                 self.win_k[:, :, write_slot : write_slot + 1].copy_(k_tok_h, non_blocking=True)
                 self.win_v[:, :, write_slot : write_slot + 1].copy_(v_tok_h, non_blocking=True)
+                self._update_window_token_in_local_buffers(write_slot, k_tok_h, v_tok_h)
                 self._update_window_token_in_page_buffers(write_slot, k_tok_h, v_tok_h)
                 self.win_ptr = (self.win_ptr + 1) % self.win_tokens
 
@@ -1158,6 +1167,9 @@ class EchoTokenPrefetchRuntime:
         return lower, upper
 
     def _sync_sink_to_local_buffers(self):
+        if not self.enable_local_kv:
+            self.local_sink_len_cached = [0, 0]
+            return
         if self.sink_len <= 0:
             self.local_sink_len_cached = [0, 0]
             return
@@ -1177,6 +1189,8 @@ class EchoTokenPrefetchRuntime:
             self.local_sink_len_cached[i] = self.sink_len
 
     def _sync_sink_to_page_buffers(self):
+        if not self.enable_page_kv:
+            return
         if self.sink_len < self.sink_tokens:
             return
         if self.n_sink_pages <= 0:
@@ -1198,6 +1212,8 @@ class EchoTokenPrefetchRuntime:
             self.page_sink_ready[i] = True
 
     def _sync_window_to_page_buffers_full(self):
+        if not self.enable_page_kv:
+            return
         if self.win_len < self.win_tokens or self.n_win_pages <= 0:
             return
         off = self.n_sink_pages + self.mid_pages
@@ -1220,6 +1236,8 @@ class EchoTokenPrefetchRuntime:
     def _update_window_token_in_page_buffers(
         self, slot: int, k_tok_h: torch.Tensor, v_tok_h: torch.Tensor
     ):
+        if not self.enable_page_kv:
+            return
         if self.n_win_pages <= 0:
             return
         page_idx = int(slot // self.page_size)
@@ -1236,8 +1254,46 @@ class EchoTokenPrefetchRuntime:
             pbuf[:, off, 0, tok_off].copy_(k_src, non_blocking=True)
             pbuf[:, off, 1, tok_off].copy_(v_src, non_blocking=True)
 
+    def _sync_window_to_local_buffers_full(self):
+        if not self.enable_local_kv:
+            return
+        if self.win_len < self.win_tokens:
+            return
+        if self.local_total_cap <= 0:
+            return
+        off = self.sink_len + self.mid_tokens
+        for i in (0, 1):
+            lk = self.local_k_buf[i]
+            lv = self.local_v_buf[i]
+            if lk is None or lv is None:
+                continue
+            lk[:, :, off : off + self.win_len].copy_(
+                self.win_k[: self.eff_batch, :, : self.win_len], non_blocking=True
+            )
+            lv[:, :, off : off + self.win_len].copy_(
+                self.win_v[: self.eff_batch, :, : self.win_len], non_blocking=True
+            )
+
+    def _update_window_token_in_local_buffers(
+        self, slot: int, k_tok_h: torch.Tensor, v_tok_h: torch.Tensor
+    ):
+        if not self.enable_local_kv:
+            return
+        if self.local_total_cap <= 0:
+            return
+        off = self.sink_len + self.mid_tokens + int(slot)
+        k_src = k_tok_h[: self.eff_batch, :, 0, :]
+        v_src = v_tok_h[: self.eff_batch, :, 0, :]
+        for i in (0, 1):
+            lk = self.local_k_buf[i]
+            lv = self.local_v_buf[i]
+            if lk is None or lv is None:
+                continue
+            lk[:, :, off : off + 1].copy_(k_src.unsqueeze(2), non_blocking=True)
+            lv[:, :, off : off + 1].copy_(v_src.unsqueeze(2), non_blocking=True)
+
     def _ensure_page_ids(self, bsz: int):
-        if self.local_pages <= 0:
+        if (not self.enable_page_kv) or self.local_pages <= 0:
             self.page_ids = None
             self.page_ids_bsz = bsz
             return
@@ -1255,6 +1311,8 @@ class EchoTokenPrefetchRuntime:
         self.page_ids_bsz = bsz
 
     def _copy_window_pages_to_page_buffer(self, dst_pages: torch.Tensor):
+        if not self.enable_page_kv:
+            return
         win_len = self.win_len
         if win_len < self.win_tokens or self.n_win_pages <= 0:
             return
@@ -1298,6 +1356,11 @@ class EchoTokenPrefetchRuntime:
         idx = idx.view(1, -1).expand(anchors.shape[0], -1)
         return anchors.gather(dim=1, index=idx)
 
+    def _maybe_sort_anchors(self, anchors: torch.Tensor) -> torch.Tensor:
+        if self.allow_anchor_overlap:
+            return anchors
+        return torch.sort(anchors, dim=-1).values
+
     def init_anchors_from_prefill(self, q_last: torch.Tensor, k_full: torch.Tensor):
         # q_last: [bsz, 1, n_qo_heads, head_dim]
         # k_full: [bsz, seq_len, n_kv_heads, head_dim]
@@ -1328,9 +1391,9 @@ class EchoTokenPrefetchRuntime:
         k = min(self.seed_anchors, mid_scores.shape[-1])
         seed = torch.topk(mid_scores, k=k, dim=-1).indices + lower
         seed = seed.to(mid_scores.dtype).mean(dim=1).round().to(torch.int32)  # [eff, k], shared over kv heads
-        seed, _ = torch.sort(seed, dim=-1)
+        seed = self._maybe_sort_anchors(seed)
         anchors = self._expand_seed_anchors(seed)
-        anchors, _ = torch.sort(anchors, dim=-1)
+        anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
 
     def _tile_starts(self, anchors: torch.Tensor, lower: int, upper: int) -> torch.Tensor:
@@ -1576,6 +1639,8 @@ class EchoTokenPrefetchRuntime:
         return True
 
     def paged_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not self.enable_page_kv:
+            raise RuntimeError("Echo page KV buffer is disabled for this attention backend")
         self._ensure_page_ids(bsz)
         pbuf = self.page_kv_buf[self.active_idx]
         if pbuf is None:
@@ -1630,6 +1695,8 @@ class EchoTokenPrefetchRuntime:
         )
 
     def local_kv(self, bsz: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not self.enable_local_kv:
+            raise RuntimeError("Echo local KV buffer is disabled for this attention backend")
         sink_len = self.sink_len
         win_len = self.win_len
         total = sink_len + self.mid_tokens + win_len
@@ -1640,7 +1707,9 @@ class EchoTokenPrefetchRuntime:
             local_k[:, :, sink_len : sink_len + self.mid_tokens].copy_(k_mid, non_blocking=True)
             local_v[:, :, sink_len : sink_len + self.mid_tokens].copy_(v_mid, non_blocking=True)
             self.local_mid_ready[self.active_idx] = True
-        if win_len > 0:
+        # When sink region is still growing, window base offset shifts and we refresh it.
+        # Otherwise window slots are maintained incrementally during append_decode_token_to_cpu.
+        if win_len > 0 and (self.sink_len < self.sink_tokens or self.win_len < self.win_tokens):
             self._copy_window_ordered(local_k, local_v, sink_len + self.mid_tokens)
         k_mid = local_k[:, :, sink_len : sink_len + self.mid_tokens]
         if self.eff_batch == 1 and bsz > 1:
@@ -1684,7 +1753,7 @@ class EchoTokenPrefetchRuntime:
             local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
         anchors = starts + local_best_cpu
-        anchors, _ = torch.sort(anchors, dim=-1)
+        anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
             self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
@@ -1725,7 +1794,7 @@ class EchoTokenPrefetchRuntime:
             local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
         local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
         anchors = self.active_starts + local_best_cpu
-        anchors, _ = torch.sort(anchors, dim=-1)
+        anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
             self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
@@ -1765,7 +1834,7 @@ class EchoTokenPrefetchRuntime:
         ).float().mean(dim=(1, 2)).round().to(torch.int32)
         local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
         anchors = self.active_starts + local_best_cpu
-        anchors, _ = torch.sort(anchors, dim=-1)
+        anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
             self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
@@ -1833,7 +1902,7 @@ class EchoTokenPrefetchRuntime:
         ).float().mean(dim=(1, 2)).round().to(torch.int32)
         local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
         anchors = self.active_starts + local_best_cpu
-        anchors, _ = torch.sort(anchors, dim=-1)
+        anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
             self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),

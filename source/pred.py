@@ -123,6 +123,9 @@ def parse_args(args=None):
     parser.add_argument("--echo_attn_backend", type=str, default="sdpa",
                         choices=["sdpa", "flashinfer", "flash_attn"],
                         help="Attention backend for EchoKV-token decode")
+    parser.add_argument("--echo_flash_mode", type=str, default="fused_fast",
+                        choices=["fused_fast", "split_overlap"],
+                        help="Flash-attn decode mode: fused_fast (lower latency) or split_overlap")
     parser.add_argument("--echo_shared_batch", dest="echo_shared_batch", action="store_true",
                         help="Use batch-0 shared anchors/recall for repeated batch decoding")
     parser.add_argument("--echo_no_shared_batch", dest="echo_shared_batch", action="store_false",
@@ -169,6 +172,7 @@ def load_model_and_tokenizer(path):
     print(f"  Echo Config: sel_policy={args.sel_policy}, seed_anchors={args.echo_num_anchors}, "
           f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}, "
           f"attn_backend={args.echo_attn_backend}, "
+          f"flash_mode={args.echo_flash_mode}, "
           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
           f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
@@ -196,6 +200,7 @@ def load_model_and_tokenizer(path):
             echo_num_anchors=args.echo_num_anchors,
             echo_anchor_head_sample=args.echo_anchor_head_sample,
             echo_attn_backend=args.echo_attn_backend,
+            echo_flash_mode=args.echo_flash_mode,
             echo_shared_batch=args.echo_shared_batch,
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             echo_use_triton_qk_select=(not args.echo_disable_triton_qk_select),
@@ -332,6 +337,22 @@ def get_pred(
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.sel_policy == "echokv_token":
+        # EchoKV-token path uses token-wise runtime recall, not FreeKV page recall.
+        if args.spec_ret:
+            print(
+                f"{YELLOW}[EchoKV] --spec_ret is ignored for sel_policy=echokv_token; disabling it.{RESET}"
+            )
+            args.spec_ret = False
+        if args.corr is not None:
+            print(
+                f"{YELLOW}[EchoKV] --corr is ignored for sel_policy=echokv_token; clearing it.{RESET}"
+            )
+            args.corr = None
+        print(
+            f"{YELLOW}[EchoKV] FreeKV recall args (--recall_impl/--cpu_layout) are kept for "
+            f"legacy cache wiring, but decode recall uses Echo token-wise recall kernels.{RESET}"
+        )
     seed_everything(args.seed)
     model2path = json.load(open("config/model2path.json", "r"))
 
