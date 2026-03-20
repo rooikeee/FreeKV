@@ -162,7 +162,11 @@ def _freekv_attn_forward(
             if state.echo_token and budget is not None:
                 state.echo_token_on_decode_append(cur_id, key_states, value_states)
             attn_page_ids = kvc.c2p
-            if budget is not None and kvc.n_pages > budget:
+            if state.echo_token and budget is not None:
+                # EchoKV native path: always decode via Echo runtime instead of
+                # switching to legacy sparse path only after budget overflow.
+                attn_output = state.decode_echo_token(cur_id, query_states)
+            elif budget is not None and kvc.n_pages > budget:
                 if state.echo_token:
                     attn_output = state.decode_echo_token(cur_id, query_states)
                 elif state.spec_ret and cur_id not in NO_SPEC_RET_LAYER_SET:

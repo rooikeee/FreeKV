@@ -124,10 +124,12 @@ def parse_args(args=None):
                         help="Chunk size (pages) for stream-overlap QK->partial-recall path")
     parser.add_argument("--echo_disable_stream_prefetch_only", action="store_true",
                         help="Disable fast stream mode (selection-only + flash-attn output) and use score-cache split path")
-    parser.add_argument("--echo_attn_backend", type=str, default="sdpa",
+    parser.add_argument("--echo_disable_native_only", action="store_true",
+                        help="Allow legacy fallback paths for echokv_token (slower; debug only)")
+    parser.add_argument("--echo_attn_backend", type=str, default="flash_attn",
                         choices=["sdpa", "flashinfer", "flash_attn"],
                         help="Attention backend for EchoKV-token decode")
-    parser.add_argument("--echo_flash_mode", type=str, default="fused_fast",
+    parser.add_argument("--echo_flash_mode", type=str, default="split_overlap",
                         choices=["fused_fast", "split_overlap"],
                         help="Flash-attn decode mode: fused_fast (lower latency) or split_overlap")
     parser.add_argument("--echo_shared_batch", dest="echo_shared_batch", action="store_true",
@@ -179,6 +181,7 @@ def load_model_and_tokenizer(path):
           f"flash_mode={args.echo_flash_mode}, "
           f"stream_chunk_pages={args.echo_stream_chunk_pages}, "
           f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
+          f"native_only={(not args.echo_disable_native_only)}, "
           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
           f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
@@ -209,6 +212,7 @@ def load_model_and_tokenizer(path):
             echo_flash_mode=args.echo_flash_mode,
             echo_stream_chunk_pages=args.echo_stream_chunk_pages,
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
+            echo_native_only=(not args.echo_disable_native_only),
             echo_shared_batch=args.echo_shared_batch,
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             echo_use_triton_qk_select=(not args.echo_disable_triton_qk_select),
@@ -346,6 +350,17 @@ def get_pred(
 if __name__ == "__main__":
     args = parse_args()
     if args.sel_policy == "echokv_token":
+        if not args.echo_disable_native_only:
+            if args.echo_attn_backend != "flash_attn":
+                print(
+                    f"{YELLOW}[EchoKV] forcing --echo_attn_backend=flash_attn in native mode.{RESET}"
+                )
+                args.echo_attn_backend = "flash_attn"
+            if args.echo_flash_mode != "split_overlap":
+                print(
+                    f"{YELLOW}[EchoKV] forcing --echo_flash_mode=split_overlap in native mode.{RESET}"
+                )
+                args.echo_flash_mode = "split_overlap"
         # EchoKV-token path uses token-wise runtime recall, not FreeKV page recall.
         if args.spec_ret:
             print(
@@ -357,10 +372,14 @@ if __name__ == "__main__":
                 f"{YELLOW}[EchoKV] --corr is ignored for sel_policy=echokv_token; clearing it.{RESET}"
             )
             args.corr = None
-        print(
-            f"{YELLOW}[EchoKV] FreeKV recall args (--recall_impl/--cpu_layout) are kept for "
-            f"legacy cache wiring, but decode recall uses Echo token-wise recall kernels.{RESET}"
-        )
+        if args.echo_disable_native_only:
+            print(
+                f"{YELLOW}[EchoKV] native_only disabled: legacy fallback paths may be used.{RESET}"
+            )
+        else:
+            print(
+                f"{YELLOW}[EchoKV] native_only enabled: decode bypasses FreeKV topk/flashinfer/page-recall paths.{RESET}"
+            )
     seed_everything(args.seed)
     model2path = json.load(open("config/model2path.json", "r"))
 

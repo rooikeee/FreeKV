@@ -181,6 +181,7 @@ class InferState:
             f"Unknown sel_policy: {self.sel_policy}"
         )
         self.echo_token = self.sel_policy == "echokv_token"
+        self.echo_native_only = bool(kwargs.get("echo_native_only", True))
         self.echo_num_anchors = int(kwargs.get("echo_num_anchors", 64))
         self.echo_shared_batch = bool(kwargs.get("echo_shared_batch", True))
         self.echo_use_cuda_token_recall = bool(
@@ -206,13 +207,27 @@ class InferState:
             kwargs.get("echo_stream_prefetch_only", True)
         )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
-        self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "sdpa")).lower()
-        self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "fused_fast")).lower()
+        self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "flash_attn")).lower()
+        self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "split_overlap")).lower()
         self.profile_timing = bool(kwargs.get("profile_timing", True))
         assert self.echo_num_anchors > 0
         assert self.echo_anchor_head_sample >= 0
         assert self.echo_attn_backend in ("sdpa", "flashinfer", "flash_attn")
         assert self.echo_flash_mode in ("fused_fast", "split_overlap")
+        if self.echo_token and self.echo_native_only:
+            if any(b is None for b in self.layer2budget):
+                raise ValueError(
+                    "echokv_token native mode requires all layers to use finite page budgets "
+                    "(no full-attention layers)."
+                )
+            if self.echo_attn_backend != "flash_attn":
+                raise ValueError(
+                    "echokv_token native mode requires echo_attn_backend=flash_attn"
+                )
+            if self.echo_flash_mode != "split_overlap":
+                raise ValueError(
+                    "echokv_token native mode requires echo_flash_mode=split_overlap"
+                )
 
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
@@ -530,6 +545,18 @@ class InferState:
         self.prefill_handler.end_forward()
 
     def _prepare_decode(self, bsz):
+        if self.echo_token and self.echo_native_only:
+            seq_for_rope = None
+            for rt in self.echo_runtimes:
+                if rt is not None:
+                    seq_for_rope = int(rt.cpu_len)
+                    break
+            if seq_for_rope is None:
+                seq_for_rope = int(self.kv_caches[0].seq_len)
+            self.rope_indptr = torch.arange(0, bsz + 1, 1, **self._i32)
+            self.rope_offsets = torch.full((bsz,), seq_for_rope, **self._i32)
+            return
+
         if self.kv_last_page_len + 1 >= self.page_size:
             self.default_stream.wait_stream(self.decode_backup_stream)
         pre = [kvc.n_real_pages for kvc in self.kv_caches]
@@ -614,6 +641,8 @@ class InferState:
                 )
 
     def _finish_decode(self, bsz):
+        if self.echo_token and self.echo_native_only:
+            return
         for handler in self.decode_handler_tab.values():
             handler.end_forward()
         if self.echo_token and self.echo_attn_backend == "flashinfer":
@@ -633,6 +662,15 @@ class InferState:
             self._finish_decode(bsz)
 
     def append_paged_kv_cache(self, layer_idx: int, keys: Tensor, vals: Tensor):
+        if (
+            self.echo_token
+            and self.echo_native_only
+            and self.layer2budget[layer_idx] is not None
+            and keys.size(1) == 1
+        ):
+            # Echo native decode path keeps decode KV only in Echo runtime buffers.
+            # Skip legacy paged-KV append for decode-token steps.
+            return
         kvc = self.kv_caches[layer_idx]
         kernels.append_paged_kv_cache(
             keys,
@@ -734,7 +772,10 @@ class InferState:
         # q: [bsz, 1, n_qo_heads, head_dim]
         rt = self.echo_runtimes[layer_idx]
         assert rt is not None
-        kvc = self.kv_caches[layer_idx]
+        if self.echo_native_only and self.echo_attn_backend != "flash_attn":
+            raise RuntimeError(
+                "Echo native decode requires flash_attn backend only"
+            )
         cur_seq = rt.cpu_len
         starts = rt.build_starts(cur_seq)
         if starts is not None and (
@@ -746,7 +787,12 @@ class InferState:
 
         ok = rt.activate_prefetch(cur_seq, self.compute_stream)
         if not ok:
+            if self.echo_native_only:
+                raise RuntimeError(
+                    "Echo native prefetch activate failed; legacy decode fallback is disabled."
+                )
             # Fallback: no sparse-ready region, use dense paged decode.
+            kvc = self.kv_caches[layer_idx]
             return self.decode_sdpa(layer_idx, q, kvc.c2p)
 
         if self.echo_attn_backend == "flashinfer":
