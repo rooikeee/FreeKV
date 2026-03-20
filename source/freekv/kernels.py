@@ -489,6 +489,55 @@ def recall_tokens_delta_linear_partial(
         page_count,
     )
 
+def echo_decode_qk_scores_chunk(
+    q,                # [bsz, n_q_heads, head_dim], cuda half/bf16
+    k,                # [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16
+    scores,           # [bsz, n_q_heads, max_tokens], cuda float32
+    n_q_per_kv: int,
+    token_begin: int,
+    token_count: int,
+):
+    _cpp.echo_decode_qk_scores_chunk(
+        q,
+        k,
+        scores,
+        n_q_per_kv,
+        token_begin,
+        token_count,
+    )
+
+def echo_decode_qk_scores_pagemax_chunk(
+    q,                # [bsz, n_q_heads, head_dim], cuda half/bf16
+    k,                # [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16
+    scores,           # [bsz, n_q_heads, max_tokens], cuda float32
+    n_q_per_kv: int,
+    token_begin: int,
+    page_size: int,
+    page_count: int,
+):
+    return _cpp.echo_decode_qk_scores_pagemax_chunk(
+        q,
+        k,
+        scores,
+        n_q_per_kv,
+        token_begin,
+        page_size,
+        page_count,
+    )
+
+def echo_decode_pv_from_scores_cuda(
+    scores,           # [bsz, n_q_heads, max_tokens], cuda float32
+    v,                # [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16
+    n_q_per_kv: int,
+    seq_len: int,
+):
+    return _cpp.echo_decode_pv_from_scores_cuda(
+        scores,
+        v,
+        n_q_per_kv,
+        seq_len,
+    )
+
 def estimate_select_recall_pool(
     # for estimate
     query_states,

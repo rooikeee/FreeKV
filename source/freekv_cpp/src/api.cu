@@ -33,6 +33,9 @@ PYBIND11_MODULE(freekv_cpp, m) {
 	m.def("recall_tokens_delta_linear", &recall_tokens_delta_linear);
 	m.def("recall_tokens_linear_partial", &recall_tokens_linear_partial);
 	m.def("recall_tokens_delta_linear_partial", &recall_tokens_delta_linear_partial);
+	m.def("echo_decode_qk_scores_chunk", &echo_decode_qk_scores_chunk);
+	m.def("echo_decode_qk_scores_pagemax_chunk", &echo_decode_qk_scores_pagemax_chunk);
+	m.def("echo_decode_pv_from_scores_cuda", &echo_decode_pv_from_scores_cuda);
 	m.def("init_recall_thread_pool", &init_recall_thread_pool);
 	m.def("shutdown_recall_thread_pool", &shutdown_recall_thread_pool);
 	m.def("estimate_select_recall_pool", &estimate_select_recall_pool);
