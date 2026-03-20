@@ -527,9 +527,9 @@ def _triton_flash_decode_attn_with_page_max(
     if (mid_start % page_size) != 0:
         return None, None
 
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
+    q_c = q if q.is_contiguous() else q.contiguous()
+    k_c = k if k.is_contiguous() else k.contiguous()
+    v_c = v if v.is_contiguous() else v.contiguous()
 
     out = torch.empty_like(q_c)
     best = torch.empty(
@@ -620,8 +620,8 @@ def _triton_flash_decode_qk_select(
     if (mid_start % page_size) != 0:
         return None, None
 
-    q_c = q.contiguous()
-    k_c = k.contiguous()
+    q_c = q if q.is_contiguous() else q.contiguous()
+    k_c = k if k.is_contiguous() else k.contiguous()
     scores = torch.empty(
         (bsz, n_q_heads, max_tokens),
         dtype=torch.float32,
@@ -696,8 +696,8 @@ def _triton_flash_decode_pv_from_scores(
     if head_dim <= 0 or head_dim > 256:
         return None
 
-    scores_c = scores.contiguous()
-    v_c = v.contiguous()
+    scores_c = scores if scores.is_contiguous() else scores.contiguous()
+    v_c = v if v.is_contiguous() else v.contiguous()
     out = torch.empty(
         (bsz, n_q_heads, head_dim),
         dtype=torch.float32,
@@ -778,9 +778,9 @@ def _triton_flash_decode_attn_plain(
     if seq_len <= 0 or max_tokens < seq_len:
         return None
 
-    q_c = q.contiguous()
-    k_c = k.contiguous()
-    v_c = v.contiguous()
+    q_c = q if q.is_contiguous() else q.contiguous()
+    k_c = k if k.is_contiguous() else k.contiguous()
+    v_c = v if v.is_contiguous() else v.contiguous()
     out = torch.empty_like(q_c)
 
     block_d = _next_pow2_cap(head_dim, 256)
@@ -1543,13 +1543,39 @@ class EchoTokenPrefetchRuntime:
         else:
             starts_i32 = starts
         starts_cpu = starts_i32 if starts_i32.device.type == "cpu" else starts_i32.to("cpu")
+        prev_active_starts = self.active_starts
         pending_idx = 1 - self.active_idx
         out_buf = self.gpu_mid[pending_idx]
 
         with torch.cuda.stream(self.recall_stream):
             used_delta = False
+            used_cuda_inplace_delta = False
             if (
                 allow_inplace_delta
+                and self.active_starts is not None
+                and self.use_cuda_token_recall
+                and hasattr(kernels, "recall_tokens_delta_linear")
+            ):
+                try:
+                    # Fast path: patch active middle buffer in place to avoid full d2d copies.
+                    kernels.recall_tokens_delta_linear(
+                        starts_i32,
+                        self.active_starts,
+                        self.cpu_kv[: self.eff_batch],
+                        self.gpu_mid[self.active_idx],
+                        self.gpu_mid[self.active_idx],
+                        self.cpu_len,
+                    )
+                    pending_idx = self.active_idx
+                    out_buf = self.gpu_mid[pending_idx]
+                    used_delta = True
+                    used_cuda_inplace_delta = True
+                except Exception:
+                    used_delta = False
+                    used_cuda_inplace_delta = False
+            if (
+                (not used_delta)
+                and allow_inplace_delta
                 and self.active_starts is not None
                 and self.use_cuda_token_recall
                 and hasattr(kernels, "recall_tokens_delta_linear")
@@ -1597,31 +1623,71 @@ class EchoTokenPrefetchRuntime:
                 local_k = self.local_k_buf[self.pending_idx]
                 local_v = self.local_v_buf[self.pending_idx]
                 off = self.sink_len
-                mid_k_hsd = out_buf[:, :, 0].permute(0, 2, 1, 3)
-                mid_v_hsd = out_buf[:, :, 1].permute(0, 2, 1, 3)
-                local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
-                local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
+                if used_cuda_inplace_delta and prev_active_starts is not None:
+                    changed = starts_cpu.ne(prev_active_starts)
+                    if bool(changed.any()):
+                        idxs = torch.nonzero(changed, as_tuple=False)
+                        for bt in idxs:
+                            b = int(bt[0].item())
+                            p = int(bt[1].item())
+                            t0 = p * self.page_size
+                            t1 = t0 + self.page_size
+                            local_k[b : b + 1, :, off + t0 : off + t1].copy_(
+                                out_buf[b : b + 1, t0:t1, 0].permute(0, 2, 1, 3),
+                                non_blocking=True,
+                            )
+                            local_v[b : b + 1, :, off + t0 : off + t1].copy_(
+                                out_buf[b : b + 1, t0:t1, 1].permute(0, 2, 1, 3),
+                                non_blocking=True,
+                            )
+                else:
+                    mid_k_hsd = out_buf[:, :, 0].permute(0, 2, 1, 3)
+                    mid_v_hsd = out_buf[:, :, 1].permute(0, 2, 1, 3)
+                    local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
+                    local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
                 self.local_mid_ready[self.pending_idx] = True
             if self.page_kv_buf[self.pending_idx] is not None:
                 self._sync_sink_to_page_buffers()
                 pbuf = self.page_kv_buf[self.pending_idx]
-                mid_pages_k = out_buf[:, :, 0].view(
-                    self.eff_batch,
-                    self.mid_pages,
-                    self.page_size,
-                    self.n_kv_heads,
-                    self.head_dim,
-                )
-                mid_pages_v = out_buf[:, :, 1].view(
-                    self.eff_batch,
-                    self.mid_pages,
-                    self.page_size,
-                    self.n_kv_heads,
-                    self.head_dim,
-                )
                 offp = self.n_sink_pages
-                pbuf[:, offp : offp + self.mid_pages, 0].copy_(mid_pages_k, non_blocking=True)
-                pbuf[:, offp : offp + self.mid_pages, 1].copy_(mid_pages_v, non_blocking=True)
+                if used_cuda_inplace_delta and prev_active_starts is not None:
+                    changed = starts_cpu.ne(prev_active_starts)
+                    if bool(changed.any()):
+                        idxs = torch.nonzero(changed, as_tuple=False)
+                        for bt in idxs:
+                            b = int(bt[0].item())
+                            p = int(bt[1].item())
+                            t0 = p * self.page_size
+                            t1 = t0 + self.page_size
+                            pbuf[b : b + 1, offp + p : offp + p + 1, 0].copy_(
+                                out_buf[b : b + 1, t0:t1, 0].view(
+                                    1, 1, self.page_size, self.n_kv_heads, self.head_dim
+                                ),
+                                non_blocking=True,
+                            )
+                            pbuf[b : b + 1, offp + p : offp + p + 1, 1].copy_(
+                                out_buf[b : b + 1, t0:t1, 1].view(
+                                    1, 1, self.page_size, self.n_kv_heads, self.head_dim
+                                ),
+                                non_blocking=True,
+                            )
+                else:
+                    mid_pages_k = out_buf[:, :, 0].view(
+                        self.eff_batch,
+                        self.mid_pages,
+                        self.page_size,
+                        self.n_kv_heads,
+                        self.head_dim,
+                    )
+                    mid_pages_v = out_buf[:, :, 1].view(
+                        self.eff_batch,
+                        self.mid_pages,
+                        self.page_size,
+                        self.n_kv_heads,
+                        self.head_dim,
+                    )
+                    pbuf[:, offp : offp + self.mid_pages, 0].copy_(mid_pages_k, non_blocking=True)
+                    pbuf[:, offp : offp + self.mid_pages, 1].copy_(mid_pages_v, non_blocking=True)
                 self.page_mid_ready[self.pending_idx] = True
             self.prefetch_event.record(self.recall_stream)
 
