@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cmath>
+#include <cfloat>
 
 #include "pytorch_extension_utils.h"
 
@@ -118,7 +119,7 @@ __global__ void echo_page_argmax_from_scores_kernel(
   const int64_t b = linear / n_q_heads;
 
   const int64_t page_tok_base = token_begin + p * page_size;
-  float best_v = -CUDART_INF_F;
+  float best_v = -FLT_MAX;
   int32_t best_i = 0;
   for (int64_t t = threadIdx.x; t < page_size; t += THREADS) {
     const int64_t tok = page_tok_base + t;
@@ -180,7 +181,7 @@ __global__ void echo_pv_from_scores_kernel(
   const float* s_base = scores_ptr + b * stride_s_b + qh * stride_s_h;
   const scalar_t* v_base = v_ptr + b * stride_v_b + kvh * stride_v_h;
 
-  float local_max = -CUDART_INF_F;
+  float local_max = -FLT_MAX;
   for (int64_t t = threadIdx.x; t < seq_len; t += THREADS) {
     local_max = fmaxf(local_max, s_base[t * stride_s_t]);
   }
