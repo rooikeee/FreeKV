@@ -285,17 +285,20 @@ class InferState:
         self.sel_stat_ms = []
         self.attn_stat_ms = []
         self.pack_stat_ms = []
+        self.wait_stat_ms = []
         self._perf_tot_ms = {
             "select": 0.0,
             "recall": 0.0,
             "attn": 0.0,
             "pack": 0.0,
+            "wait": 0.0,
         }
         self._perf_pending = {
             "select": [],
             "recall": [],
             "attn": [],
             "pack": [],
+            "wait": [],
         }
         self.corr_checks = [0] * n_layers
         self.corr_triggers = [0] * n_layers
@@ -393,6 +396,7 @@ class InferState:
             "recall": self.recall_stat_ms,
             "attn": self.attn_stat_ms,
             "pack": self.pack_stat_ms,
+            "wait": self.wait_stat_ms,
         }
         for sec, pairs in self._perf_pending.items():
             if not pairs:
@@ -411,6 +415,7 @@ class InferState:
         self.recall_stat_ms.clear()
         self.attn_stat_ms.clear()
         self.pack_stat_ms.clear()
+        self.wait_stat_ms.clear()
         for k in self._perf_tot_ms:
             self._perf_tot_ms[k] = 0.0
         for k in self._perf_pending:
@@ -423,10 +428,12 @@ class InferState:
             "recall_ms": float(self._perf_tot_ms["recall"]),
             "attn_ms": float(self._perf_tot_ms["attn"]),
             "pack_ms": float(self._perf_tot_ms["pack"]),
+            "wait_ms": float(self._perf_tot_ms["wait"]),
             "select_calls": len(self.sel_stat_ms),
             "recall_calls": len(self.recall_stat_ms),
             "attn_calls": len(self.attn_stat_ms),
             "pack_calls": len(self.pack_stat_ms),
+            "wait_calls": len(self.wait_stat_ms),
         }
         if reset:
             self.reset_perf_stats()
@@ -463,27 +470,38 @@ class InferState:
             )
             for i in range(self.n_layers)
         ]
-        self.dg_caches = [
-            self.layer2budget[i] and KvCache(self._pool, bsz)
-            for i in range(self.n_layers)
-        ]
-        self._cpu_pool.clear()
-        self.cpu_kv_caches = [
-            self.layer2budget[i] and KvCache(self._cpu_pool, bsz)
-            for i in range(self.n_layers)
-        ]
+        if self.echo_token and self.echo_native_only:
+            self.dg_caches = [None] * self.n_layers
+            self._cpu_pool.clear()
+            self.cpu_kv_caches = [None] * self.n_layers
+        else:
+            self.dg_caches = [
+                self.layer2budget[i] and KvCache(self._pool, bsz)
+                for i in range(self.n_layers)
+            ]
+            self._cpu_pool.clear()
+            self.cpu_kv_caches = [
+                self.layer2budget[i] and KvCache(self._cpu_pool, bsz)
+                for i in range(self.n_layers)
+            ]
 
-        max_topk = max([k for k in self.layer2topk if k] + [0])
-        max_cap = max([b for b in self.layer2budget if b] + [0])
-        bsz1 = bsz * self.n_groups
-        self.topk_dout = torch.empty([self.n_layers, bsz1 * max_cap], **self._fp)
-        self.topk_iout = torch.empty(
-            [self.n_layers, bsz1 * (max_topk + self.n_sink_pages + self.n_win_pages)], **self._i32
-        )
-        self.topk_newi = torch.empty([self.n_layers, bsz1 * max_cap], **self._fp)
-        self.topk_rids = torch.empty([self.n_layers, bsz1 * (max_topk + 1)], **self._i32)
-
-        self.topk_buff = torch.empty([self.n_layers, bsz1 * (1 << 10)], **self._u8)
+        if self.echo_token and self.echo_native_only:
+            self.topk_dout = torch.empty([self.n_layers, 1], **self._fp)
+            self.topk_iout = torch.empty([self.n_layers, 1], **self._i32)
+            self.topk_newi = torch.empty([self.n_layers, 1], **self._fp)
+            self.topk_rids = torch.empty([self.n_layers, 1], **self._i32)
+            self.topk_buff = torch.empty([self.n_layers, 1], **self._u8)
+        else:
+            max_topk = max([k for k in self.layer2topk if k] + [0])
+            max_cap = max([b for b in self.layer2budget if b] + [0])
+            bsz1 = bsz * self.n_groups
+            self.topk_dout = torch.empty([self.n_layers, bsz1 * max_cap], **self._fp)
+            self.topk_iout = torch.empty(
+                [self.n_layers, bsz1 * (max_topk + self.n_sink_pages + self.n_win_pages)], **self._i32
+            )
+            self.topk_newi = torch.empty([self.n_layers, bsz1 * max_cap], **self._fp)
+            self.topk_rids = torch.empty([self.n_layers, bsz1 * (max_topk + 1)], **self._i32)
+            self.topk_buff = torch.empty([self.n_layers, bsz1 * (1 << 10)], **self._u8)
         # we do not pre-allocate real kv-pages before prefill
         [kvc.prefill_alloc_n_tokens(q_len) for kvc in self.cpu_kv_caches if kvc]
         n_kv_pages = (q_len + self.page_size - 1) // self.page_size
@@ -496,22 +514,23 @@ class InferState:
                 0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
             )
 
-        n_filled_kv_pages = n_kv_pages - 1
-        assert n_filled_kv_pages > 0, (
-            f"prefill requires q_len > page_size for digest cache construction: "
-            f"q_len={q_len}, page_size={self.page_size}"
-        )
-        [
-            dgc.prefill_alloc_n_tokens(n_filled_kv_pages, self.alloc_page)
-            for dgc in self.dg_caches
-            if dgc
-        ]
-        n_dg_pages = (n_filled_kv_pages + self.page_size - 1) // self.page_size
-        self.dg_last_page_len = (n_filled_kv_pages - 1) % self.page_size + 1
-        self.dg_last_page_lens = torch.tensor(
-            [self.dg_last_page_len] * bsz, **self._i32
-        )
-        self.dg_indptrs = torch.arange(0, bsz * n_dg_pages + 1, n_dg_pages, **self._i32)
+        if not (self.echo_token and self.echo_native_only):
+            n_filled_kv_pages = n_kv_pages - 1
+            assert n_filled_kv_pages > 0, (
+                f"prefill requires q_len > page_size for digest cache construction: "
+                f"q_len={q_len}, page_size={self.page_size}"
+            )
+            [
+                dgc.prefill_alloc_n_tokens(n_filled_kv_pages, self.alloc_page)
+                for dgc in self.dg_caches
+                if dgc
+            ]
+            n_dg_pages = (n_filled_kv_pages + self.page_size - 1) // self.page_size
+            self.dg_last_page_len = (n_filled_kv_pages - 1) % self.page_size + 1
+            self.dg_last_page_lens = torch.tensor(
+                [self.dg_last_page_len] * bsz, **self._i32
+            )
+            self.dg_indptrs = torch.arange(0, bsz * n_dg_pages + 1, n_dg_pages, **self._i32)
 
         self.rope_indptr = torch.arange(0, (bsz+1)*q_len, q_len, **self._i32)
         self.rope_offsets = torch.zeros(bsz, **self._i32)
@@ -785,7 +804,9 @@ class InferState:
             rt.launch_prefetch(starts, target_seq_len=cur_seq)
             self._perf_stop("recall", rec_t0, stream=rt.recall_stream)
 
+        wait_t0 = self._perf_start("wait", stream=self.compute_stream)
         ok = rt.activate_prefetch(cur_seq, self.compute_stream)
+        self._perf_stop("wait", wait_t0, stream=self.compute_stream)
         if not ok:
             if self.echo_native_only:
                 raise RuntimeError(
@@ -831,32 +852,40 @@ class InferState:
                 self._perf_stop("pack", pack_t0)
 
                 stream_prefetch_ready = False
-                score_cache = None
-
+                attn_t0 = self._perf_start("attn")
                 if rt.stream_prefetch_only:
+                    out = rt.attend_flash_attn(
+                        q,
+                        local_k,
+                        local_v,
+                        strict=False,
+                    )
+                    self._perf_stop("attn", attn_t0)
+
+                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
                     stream_prefetch_ready = rt.select_and_prefetch_stream_only(
                         q,
                         local_k,
                         target_seq_len=cur_seq + 1,
+                        allow_inplace_delta=True,
                     )
                     if (not stream_prefetch_ready):
                         if self.echo_require_triton_flash:
                             raise RuntimeError(
                                 "echo stream_prefetch_only path is unavailable, "
                                 "which means chunk-level CUDA page-max + partial recall "
-                                "did not run. Disable strict mode or disable stream_prefetch_only."
+                                "did not run."
                             )
-                        sel_t0 = self._perf_start("select")
-                        score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
-                            q,
-                            local_k,
-                            target_seq_len=cur_seq + 1,
-                        )
-                        stream_prefetch_ready = score_cache is not None
-                        if score_cache is None:
-                            score_cache = rt.qk_select_and_cache_scores(q, local_k)
-                        self._perf_stop("select", sel_t0)
+                        next_starts = rt.build_starts(cur_seq + 1)
+                        if next_starts is not None:
+                            rt.launch_prefetch(
+                                next_starts,
+                                target_seq_len=cur_seq + 1,
+                                allow_inplace_delta=True,
+                            )
+                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
                 else:
+                    score_cache = None
                     sel_t0 = self._perf_start("select")
                     score_cache = rt.qk_select_and_cache_scores_stream_prefetch(
                         q,
@@ -868,36 +897,27 @@ class InferState:
                         score_cache = rt.qk_select_and_cache_scores(q, local_k)
                     self._perf_stop("select", sel_t0)
 
-                if (not stream_prefetch_ready) and score_cache is None:
-                    if self.echo_require_triton_flash:
-                        raise RuntimeError(
-                            "echo_attn_backend=flash_attn requires QK-select stage, "
-                            "but stage-1 returned None."
-                        )
-                    sel_fb_t0 = self._perf_start("select")
-                    rt.update_anchors_from_active_mid(q)
-                    self._perf_stop("select", sel_fb_t0)
+                    if (not stream_prefetch_ready) and score_cache is None:
+                        if self.echo_require_triton_flash:
+                            raise RuntimeError(
+                                "echo_attn_backend=flash_attn requires QK-select stage, "
+                                "but stage-1 returned None."
+                            )
+                        sel_fb_t0 = self._perf_start("select")
+                        rt.update_anchors_from_active_mid(q)
+                        self._perf_stop("select", sel_fb_t0)
 
-                if not stream_prefetch_ready:
-                    next_starts = rt.build_starts(cur_seq + 1)
-                    if next_starts is not None:
-                        rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
-                        rt.launch_prefetch(
-                            next_starts,
-                            target_seq_len=cur_seq + 1,
-                            allow_inplace_delta=True,
-                        )
-                        self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+                    if not stream_prefetch_ready:
+                        next_starts = rt.build_starts(cur_seq + 1)
+                        if next_starts is not None:
+                            rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                            rt.launch_prefetch(
+                                next_starts,
+                                target_seq_len=cur_seq + 1,
+                                allow_inplace_delta=True,
+                            )
+                            self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
 
-                attn_t0 = self._perf_start("attn")
-                if rt.stream_prefetch_only:
-                    out = rt.attend_flash_attn(
-                        q,
-                        local_k,
-                        local_v,
-                        strict=False,
-                    )
-                else:
                     out = rt.pv_from_score_cache(score_cache, local_v, q.shape[0])
                     if out is None:
                         if self.echo_require_triton_flash:
@@ -911,7 +931,7 @@ class InferState:
                             local_v,
                             strict=False,
                         )
-                self._perf_stop("attn", attn_t0)
+                    self._perf_stop("attn", attn_t0)
             else:
                 # Fast path: single fused attention kernel with page argmax.
                 # This minimizes decode latency by avoiding split QK/PV score cache.
@@ -1154,6 +1174,8 @@ class InferState:
         self.save_digests(layer_idx, self._summarize_keys(filled_keys))
 
     def prefill_evict_extra_pages(self, layer_idx: int, query_states: Tensor):
+        if self.echo_token and self.echo_native_only:
+            return
         kvc = self.kv_caches[layer_idx]
         bsz = kvc.batch_size
         ng = self.n_groups

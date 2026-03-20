@@ -2179,6 +2179,7 @@ class EchoTokenPrefetchRuntime:
         q: torch.Tensor,         # [bsz, 1, n_qo_heads, head_dim]
         local_k: torch.Tensor,   # [eff/bsz, n_kv_heads, s, head_dim]
         target_seq_len: int,
+        allow_inplace_delta: bool = True,
     ) -> bool:
         # Fast stream mode:
         # - run chunk-level page-max selection only (no full score cache)
@@ -2222,7 +2223,7 @@ class EchoTokenPrefetchRuntime:
             (eff, self.mid_pages), dtype=torch.int32, device=torch.device("cpu")
         )
 
-        pending_idx = 1 - self.active_idx
+        pending_idx = self.active_idx if allow_inplace_delta else (1 - self.active_idx)
         out_buf = self.gpu_mid[pending_idx]
         starts_dev = starts_full
         prev_starts_dev = self.active_starts

@@ -315,7 +315,10 @@ def get_pred(
         recall_ms = perf["recall_ms"]
         attn_ms = perf["attn_ms"]
         pack_ms = perf.get("pack_ms", 0.0)
-        other_decode_ms = max(0.0, decode_total_ms - select_ms - recall_ms - attn_ms - pack_ms)
+        wait_ms = perf.get("wait_ms", 0.0)
+        other_decode_ms = max(
+            0.0, decode_total_ms - select_ms - recall_ms - attn_ms - pack_ms - wait_ms
+        )
 
         print(f"\n{GREEN}{SEP}")
         print(f"  [{model_name}] Generation Summary")
@@ -327,6 +330,7 @@ def get_pred(
         print(f"  Avg TBT (decode) : {avg_tbt:.2f} ms")
         print(f"  Select time      : {select_ms/1000:.2f}s ({perf['select_calls']} calls)")
         print(f"  Recall time      : {recall_ms/1000:.2f}s ({perf['recall_calls']} calls)")
+        print(f"  Wait(prefetch)   : {wait_ms/1000:.2f}s ({perf.get('wait_calls', 0)} calls)")
         print(f"  Assemble time    : {pack_ms/1000:.2f}s ({perf.get('pack_calls', 0)} calls)")
         print(f"  Decode attn time : {attn_ms/1000:.2f}s ({perf['attn_calls']} calls)")
         print(f"  Decode other     : {other_decode_ms/1000:.2f}s")
