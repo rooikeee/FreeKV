@@ -852,6 +852,7 @@ class EchoTokenPrefetchRuntime:
         enable_page_kv: bool = True,
         stream_chunk_pages: int = 4,
         stream_prefetch_only: bool = True,
+        prefetch_pack_buffers: bool = False,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -873,6 +874,7 @@ class EchoTokenPrefetchRuntime:
         self.enable_page_kv = bool(enable_page_kv)
         self.stream_chunk_pages = int(max(1, stream_chunk_pages))
         self.stream_prefetch_only = bool(stream_prefetch_only)
+        self.prefetch_pack_buffers = bool(prefetch_pack_buffers)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -1677,7 +1679,7 @@ class EchoTokenPrefetchRuntime:
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
             self.page_mid_ready[pending_idx] = False
-            if self.local_k_buf[self.pending_idx] is not None:
+            if self.prefetch_pack_buffers and self.local_k_buf[self.pending_idx] is not None:
                 local_k = self.local_k_buf[self.pending_idx]
                 local_v = self.local_v_buf[self.pending_idx]
                 off = self.sink_len
@@ -1686,7 +1688,7 @@ class EchoTokenPrefetchRuntime:
                 local_k[:, :, off : off + self.mid_tokens].copy_(mid_k_hsd, non_blocking=True)
                 local_v[:, :, off : off + self.mid_tokens].copy_(mid_v_hsd, non_blocking=True)
                 self.local_mid_ready[self.pending_idx] = True
-            if self.page_kv_buf[self.pending_idx] is not None:
+            if self.prefetch_pack_buffers and self.page_kv_buf[self.pending_idx] is not None:
                 self._sync_sink_to_page_buffers()
                 pbuf = self.page_kv_buf[self.pending_idx]
                 offp = self.n_sink_pages
@@ -2127,7 +2129,7 @@ class EchoTokenPrefetchRuntime:
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
             self.page_mid_ready[pending_idx] = False
-            if self.local_k_buf[pending_idx] is not None:
+            if self.prefetch_pack_buffers and self.local_k_buf[pending_idx] is not None:
                 local_k_dst = self.local_k_buf[pending_idx]
                 local_v_dst = self.local_v_buf[pending_idx]
                 off = self.sink_len
@@ -2140,7 +2142,7 @@ class EchoTokenPrefetchRuntime:
                     mid_v_hsd, non_blocking=True
                 )
                 self.local_mid_ready[pending_idx] = True
-            if self.page_kv_buf[pending_idx] is not None:
+            if self.prefetch_pack_buffers and self.page_kv_buf[pending_idx] is not None:
                 self._sync_sink_to_page_buffers()
                 pbuf = self.page_kv_buf[pending_idx]
                 offp = self.n_sink_pages
@@ -2310,7 +2312,7 @@ class EchoTokenPrefetchRuntime:
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
             self.page_mid_ready[pending_idx] = False
-            if self.local_k_buf[pending_idx] is not None:
+            if self.prefetch_pack_buffers and self.local_k_buf[pending_idx] is not None:
                 local_k_dst = self.local_k_buf[pending_idx]
                 local_v_dst = self.local_v_buf[pending_idx]
                 off = self.sink_len
@@ -2323,7 +2325,7 @@ class EchoTokenPrefetchRuntime:
                     mid_v_hsd, non_blocking=True
                 )
                 self.local_mid_ready[pending_idx] = True
-            if self.page_kv_buf[pending_idx] is not None:
+            if self.prefetch_pack_buffers and self.page_kv_buf[pending_idx] is not None:
                 self._sync_sink_to_page_buffers()
                 pbuf = self.page_kv_buf[pending_idx]
                 offp = self.n_sink_pages

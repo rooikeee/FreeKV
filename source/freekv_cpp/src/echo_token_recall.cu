@@ -239,6 +239,109 @@ void recall_tokens_delta_linear(
       const int64_t sb_new = (starts_bsz == 1) ? 0 : b;
       const int64_t sb_old = (prev_starts_bsz == 1) ? 0 : b;
 
+      if (!same_buffer) {
+        scalar_t* dst_batch = dst_base + b * dst_stride_b;
+        scalar_t* prev_batch = prev_base + b * prev_stride_b;
+        memcpy_async_checked(
+            dst_batch,
+            prev_batch,
+            page_bytes * static_cast<size_t>(n_pages),
+            cudaMemcpyDeviceToDevice,
+            stream,
+            "recall_tokens_delta_linear(d2d_full_prev)");
+
+        int64_t p2 = 0;
+        while (p2 < n_pages) {
+          const int64_t s_new =
+              static_cast<int64_t>(starts_ptr[sb_new * n_pages + p2]);
+          const int64_t s_old =
+              static_cast<int64_t>(prev_starts_ptr[sb_old * n_pages + p2]);
+          const int64_t shift = s_new - s_old;
+          if (shift == 0) {
+            ++p2;
+            continue;
+          }
+
+          scalar_t* dst_page =
+              dst_batch + (p2 * page_size) * dst_stride_tok;
+
+          if (shift >= page_size || shift <= -page_size) {
+            int64_t run_pages = 1;
+            while (p2 + run_pages < n_pages) {
+              const int64_t sn = static_cast<int64_t>(
+                  starts_ptr[sb_new * n_pages + p2 + run_pages]);
+              const int64_t so = static_cast<int64_t>(
+                  prev_starts_ptr[sb_old * n_pages + p2 + run_pages]);
+              const int64_t sh = sn - so;
+              if (!(sh >= page_size || sh <= -page_size)) {
+                break;
+              }
+              if (sn != s_new + run_pages * page_size) {
+                break;
+              }
+              ++run_pages;
+            }
+            scalar_t* src_ptr = src_base + b * src_stride_b + s_new * cpu_stride_tok;
+            memcpy_async_checked(
+                dst_page,
+                src_ptr,
+                page_bytes * static_cast<size_t>(run_pages),
+                cudaMemcpyHostToDevice,
+                stream,
+                "recall_tokens_delta_linear(h2d_full_patch)");
+            p2 += run_pages;
+            continue;
+          }
+
+          int64_t run_pages = 1;
+          while (p2 + run_pages < n_pages) {
+            const int64_t sn = static_cast<int64_t>(
+                starts_ptr[sb_new * n_pages + p2 + run_pages]);
+            const int64_t so = static_cast<int64_t>(
+                prev_starts_ptr[sb_old * n_pages + p2 + run_pages]);
+            const int64_t sh = sn - so;
+            if (sh != shift) {
+              break;
+            }
+            if (sn != s_new + run_pages * page_size) {
+              break;
+            }
+            ++run_pages;
+          }
+
+          if (shift > 0) {
+            const int64_t overlap = page_size - shift;
+            scalar_t* h2d_src = src_base + b * src_stride_b + (s_new + overlap) * cpu_stride_tok;
+            scalar_t* h2d_dst = dst_page + overlap * dst_stride_tok;
+            memcpy2d_async_checked(
+                h2d_dst,
+                page_pitch_bytes,
+                h2d_src,
+                page_pitch_bytes,
+                static_cast<size_t>(shift) * token_bytes,
+                static_cast<size_t>(run_pages),
+                cudaMemcpyHostToDevice,
+                stream,
+                "recall_tokens_delta_linear(h2d_tail_patch)");
+          } else {
+            const int64_t shift_abs = -shift;
+            scalar_t* h2d_src = src_base + b * src_stride_b + s_new * cpu_stride_tok;
+            memcpy2d_async_checked(
+                dst_page,
+                page_pitch_bytes,
+                h2d_src,
+                page_pitch_bytes,
+                static_cast<size_t>(shift_abs) * token_bytes,
+                static_cast<size_t>(run_pages),
+                cudaMemcpyHostToDevice,
+                stream,
+                "recall_tokens_delta_linear(h2d_head_patch)");
+          }
+          p2 += run_pages;
+        }
+        continue;
+      }
+
       int64_t p = 0;
       while (p < n_pages) {
         const int64_t s_new = static_cast<int64_t>(starts_ptr[sb_new * n_pages + p]);
