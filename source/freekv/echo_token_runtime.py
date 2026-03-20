@@ -916,6 +916,9 @@ class EchoTokenPrefetchRuntime:
         self.page_ids_bsz = 0
 
         self.gpu_mid = [None, None]  # [eff_bsz, mid_tokens, 2, n_kv_heads, head_dim]
+        self.dense_k = None  # [eff_bsz, n_kv_heads, cap, head_dim]
+        self.dense_v = None
+        self.dense_cap = 0
         self.pending_idx = 0
         self.active_idx = 0
         self.pending_seq_len = -1
@@ -929,6 +932,29 @@ class EchoTokenPrefetchRuntime:
         self.prefetch_hint_seq_len = -1
         self.slide_half_window = self.page_size // 2
         self._head_idx = None
+
+    def _ensure_dense_gpu_buffers(self, need_tokens: int):
+        if need_tokens <= 0:
+            return
+        if (
+            self.dense_k is not None
+            and self.dense_v is not None
+            and self.dense_cap >= need_tokens
+            and self.dense_k.shape[0] == self.eff_batch
+            and self.dense_k.dtype == self.dtype
+            and self.dense_k.device == self.device
+        ):
+            return
+        cap = max(256, int(self.dense_cap))
+        while cap < int(need_tokens):
+            cap *= 2
+        self.dense_k = torch.empty(
+            (self.eff_batch, self.n_kv_heads, cap, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.dense_v = torch.empty_like(self.dense_k)
+        self.dense_cap = cap
 
     def _effective_batch(self, bsz: int) -> int:
         if self.shared_batch and bsz > 1:
@@ -1044,6 +1070,47 @@ class EchoTokenPrefetchRuntime:
         self.page_ids = None
         self.page_ids_bsz = 0
         self._head_idx = None
+
+    def bootstrap_anchors_from_cpu(self, q: torch.Tensor, seq_len: int) -> bool:
+        # Used when prompt is short and middle bounds become valid only after
+        # some decode steps.
+        if self.mid_pages <= 0:
+            return False
+        if self.anchors is not None:
+            return True
+        bounds = self.middle_bounds(int(seq_len))
+        if bounds is None:
+            return False
+        bsz = q.shape[0]
+        eff = self._effective_batch(bsz)
+        q_use = q[:1] if eff == 1 and bsz > 1 else q
+        if int(seq_len) <= 0:
+            return False
+        k_full = self.cpu_kv[:eff, : int(seq_len), 0].to(
+            device=q.device, non_blocking=True
+        )
+        self.init_anchors_from_prefill(q_use.contiguous(), k_full.contiguous())
+        return self.anchors is not None
+
+    def attend_flash_attn_dense_from_cpu(
+        self,
+        q: torch.Tensor,
+        strict: bool = False,
+    ) -> torch.Tensor:
+        # Dense fallback for early/short-context decode when middle recall
+        # layout is not yet valid.
+        seq_len = int(self.cpu_len)
+        if seq_len <= 0:
+            raise RuntimeError("Echo dense-from-cpu attention requires cpu_len > 0")
+        eff = self._effective_batch(q.shape[0])
+        self._ensure_dense_gpu_buffers(seq_len)
+        k_dst = self.dense_k[:eff, :, :seq_len]
+        v_dst = self.dense_v[:eff, :, :seq_len]
+        k_src = self.cpu_kv[:eff, :seq_len, 0].permute(0, 2, 1, 3)
+        v_src = self.cpu_kv[:eff, :seq_len, 1].permute(0, 2, 1, 3)
+        k_dst.copy_(k_src, non_blocking=True)
+        v_dst.copy_(v_src, non_blocking=True)
+        return self.attend_flash_attn(q, k_dst, v_dst, strict=strict)
 
     def _maybe_expand_cpu(self, needed_tokens: int):
         if needed_tokens <= self.cpu_capacity:

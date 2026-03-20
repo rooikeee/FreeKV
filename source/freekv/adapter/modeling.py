@@ -161,6 +161,8 @@ def _freekv_attn_forward(
                 infer_state.prefill_evict_extra_pages(
                     cur_id, query_states[:, -1:, ...].contiguous()
                 )
+            else:
+                state.release_prefill_kv_pages(cur_id)
         else:
             if state.echo_token and budget is not None:
                 state.echo_token_on_decode_append(cur_id, key_states, value_states)

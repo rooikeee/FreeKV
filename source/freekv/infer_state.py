@@ -553,6 +553,11 @@ class InferState:
         )
 
     def _finish_prefill(self, bsz, q_len):
+        if self.echo_token and self.echo_native_only:
+            # Native Echo decode does not consume legacy paged-KV decode metadata.
+            # Prefill handler still needs end_forward for wrapper lifecycle.
+            self.prefill_handler.end_forward()
+            return
         for b, ls in self.budget2layers.items():
             n_kv_pages = utils.all_eq(self.kv_caches[l].n_real_pages for l in ls)
             self.kv_decode_indptrs_tab[b] = self.kv_indptrs_tab[b] = torch.arange(
@@ -567,6 +572,16 @@ class InferState:
                     0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
                 )
         self.prefill_handler.end_forward()
+
+    def release_prefill_kv_pages(self, layer_idx: int):
+        # Native Echo decode path does not use legacy paged-KV caches after
+        # each layer prefill forward. Release immediately to keep pool pressure low.
+        if not (self.echo_token and self.echo_native_only):
+            return
+        kvc = self.kv_caches[layer_idx]
+        if kvc is None or kvc.n_real_pages <= 0:
+            return
+        kvc.clear()
 
     def _prepare_decode(self, bsz):
         if self.echo_token and self.echo_native_only:
@@ -796,12 +811,20 @@ class InferState:
         # q: [bsz, 1, n_qo_heads, head_dim]
         rt = self.echo_runtimes[layer_idx]
         assert rt is not None
+        kvc = self.kv_caches[layer_idx]
         if self.echo_native_only and self.echo_attn_backend != "flash_attn":
             raise RuntimeError(
                 "Echo native decode requires flash_attn backend only"
             )
         cur_seq = rt.cpu_len
         starts = rt.build_starts(cur_seq)
+        if starts is None and rt.anchors is None:
+            # Short-prompt decode: bootstrap anchors only when middle bounds
+            # become valid at runtime.
+            sel_boot_t0 = self._perf_start("select")
+            rt.bootstrap_anchors_from_cpu(q, cur_seq)
+            self._perf_stop("select", sel_boot_t0)
+            starts = rt.build_starts(cur_seq)
         if starts is not None and (
             (not rt.prefetch_ready) or (rt.pending_seq_len != int(cur_seq))
         ):
@@ -812,13 +835,29 @@ class InferState:
         wait_t0 = self._perf_start("wait", stream=self.compute_stream)
         ok = rt.activate_prefetch(cur_seq, self.compute_stream)
         self._perf_stop("wait", wait_t0, stream=self.compute_stream)
+        if (not ok) and (starts is not None):
+            # One-shot retry: in long decode, overlap timing may miss ready flag.
+            rec_retry_t0 = self._perf_start("recall", stream=rt.recall_stream)
+            rt.launch_prefetch(starts, target_seq_len=cur_seq)
+            self._perf_stop("recall", rec_retry_t0, stream=rt.recall_stream)
+            wait_retry_t0 = self._perf_start("wait", stream=self.compute_stream)
+            ok = rt.activate_prefetch(cur_seq, self.compute_stream)
+            self._perf_stop("wait", wait_retry_t0, stream=self.compute_stream)
         if not ok:
+            if starts is None:
+                # Native dense fallback for short/early decode where middle
+                # recall region is not valid yet.
+                attn_t0 = self._perf_start("attn")
+                out = rt.attend_flash_attn_dense_from_cpu(q, strict=False)
+                self._perf_stop("attn", attn_t0)
+                return out
             if self.echo_native_only:
                 raise RuntimeError(
-                    "Echo native prefetch activate failed; legacy decode fallback is disabled."
+                    "Echo native prefetch activate failed after retry "
+                    f"(seq_len={cur_seq}, prefetch_ready={rt.prefetch_ready}, "
+                    f"pending_seq_len={rt.pending_seq_len})."
                 )
             # Fallback: no sparse-ready region, use dense paged decode.
-            kvc = self.kv_caches[layer_idx]
             return self.decode_sdpa(layer_idx, q, kvc.c2p)
 
         if self.echo_attn_backend == "flashinfer":
@@ -1223,6 +1262,7 @@ class InferState:
 
     def alloc_page(self):
         if len(self._pool._free_ids) <= 0:
+            reclaimed = False
             for i in range(self.n_layers):
                 kvc = self.kv_caches[i]
                 evt = self.prefill_backup_events[i]
@@ -1238,7 +1278,25 @@ class InferState:
                 ]
                 self.prefill_backup_events[i] = None
                 self.prefill_evicted_pages[i] = None
+                reclaimed = True
                 break
+            if (not reclaimed) and len(self._pool._free_ids) <= 0:
+                page_bytes = (
+                    2
+                    * self.page_size
+                    * self.n_kv_heads
+                    * self.head_dim
+                    * self.dtype.itemsize
+                )
+                used_pages = int(self.n_max_pages - len(self._pool._free_ids))
+                used_gb = (used_pages * page_bytes) / float(1 << 30)
+                cap_gb = (self.n_max_pages * page_bytes) / float(1 << 30)
+                raise RuntimeError(
+                    "KV page pool exhausted before reclamation. "
+                    f"used_pages={used_pages}, max_pages={self.n_max_pages}, "
+                    f"used_gb={used_gb:.2f}, cap_gb={cap_gb:.2f}. "
+                    "This usually means prefill page demand exceeds n_max_bytes."
+                )
         return self._pool.alloc_page()
 
     def prefill_sdpa(self, layer_idx: int, q: Tensor, page_ids: Tensor = None):
