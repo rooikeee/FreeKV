@@ -2412,8 +2412,13 @@ class EchoTokenPrefetchRuntime:
         if self.mid_pages <= 0:
             return None
         has_cuda_qk_chunk = hasattr(kernels, "echo_decode_qk_scores_chunk")
+        has_cuda_qk_pagemax_reduced = hasattr(
+            kernels, "echo_decode_qk_scores_pagemax_chunk_reduced"
+        )
         has_cuda_qk_pagemax = hasattr(kernels, "echo_decode_qk_scores_pagemax_chunk")
-        if (not self.use_triton_flash_attn) and (not (has_cuda_qk_chunk and has_cuda_qk_pagemax)):
+        if (not self.use_triton_flash_attn) and (
+            not (has_cuda_qk_chunk and (has_cuda_qk_pagemax_reduced or has_cuda_qk_pagemax))
+        ):
             return None
         if self.active_starts is None:
             return None
@@ -2424,8 +2429,9 @@ class EchoTokenPrefetchRuntime:
             q_use = q
         q_compact = q_use[:, 0].contiguous()  # [eff, n_qo_heads, head_dim]
         scores = None
+        local_best = None
         qh_best = None
-        if has_cuda_qk_chunk and has_cuda_qk_pagemax:
+        if has_cuda_qk_chunk and (has_cuda_qk_pagemax_reduced or has_cuda_qk_pagemax):
             try:
                 scores = self._acquire_score_cache(q_compact.shape[0], q_compact.device)
                 seq_len = int(local_k.shape[2])
@@ -2437,20 +2443,32 @@ class EchoTokenPrefetchRuntime:
                     0,
                     seq_len,
                 )
-                qh_best = kernels.echo_decode_qk_scores_pagemax_chunk(
-                    q_compact,
-                    local_k,
-                    scores,
-                    self.n_q_per_kv,
-                    self.sink_len,
-                    self.page_size,
-                    self.mid_pages,
-                )
+                if has_cuda_qk_pagemax_reduced:
+                    local_best = kernels.echo_decode_qk_scores_pagemax_chunk_reduced(
+                        q_compact,
+                        local_k,
+                        scores,
+                        self.n_q_per_kv,
+                        self.sink_len,
+                        self.page_size,
+                        self.mid_pages,
+                    )
+                else:
+                    qh_best = kernels.echo_decode_qk_scores_pagemax_chunk(
+                        q_compact,
+                        local_k,
+                        scores,
+                        self.n_q_per_kv,
+                        self.sink_len,
+                        self.page_size,
+                        self.mid_pages,
+                    )
             except Exception:
                 scores = None
+                local_best = None
                 qh_best = None
 
-        if scores is None or qh_best is None:
+        if scores is None or (local_best is None and qh_best is None):
             scores, qh_best = _triton_flash_decode_qk_select(
                 q_compact,
                 local_k,
@@ -2460,12 +2478,14 @@ class EchoTokenPrefetchRuntime:
                 mid_pages=self.mid_pages,
                 max_tokens=self.local_total_cap,
             )
-        if scores is None or qh_best is None:
+            local_best = None
+        if scores is None or (local_best is None and qh_best is None):
             return None
 
-        local_best = qh_best.view(
-            qh_best.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
-        ).float().mean(dim=(1, 2)).round().to(torch.int32)
+        if local_best is None:
+            local_best = qh_best.view(
+                qh_best.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
+            ).float().mean(dim=(1, 2)).round().to(torch.int32)
         starts_i32 = (
             self.active_starts
             if self.active_starts.dtype == torch.int32
@@ -2494,8 +2514,13 @@ class EchoTokenPrefetchRuntime:
         if self.mid_pages <= 0:
             return None
         has_cuda_qk_chunk = hasattr(kernels, "echo_decode_qk_scores_chunk")
+        has_cuda_qk_pagemax_reduced = hasattr(
+            kernels, "echo_decode_qk_scores_pagemax_chunk_reduced"
+        )
         has_cuda_qk_pagemax = hasattr(kernels, "echo_decode_qk_scores_pagemax_chunk")
-        if (not self.use_triton_flash_attn) and (not (has_cuda_qk_chunk and has_cuda_qk_pagemax)):
+        if (not self.use_triton_flash_attn) and (
+            not (has_cuda_qk_chunk and (has_cuda_qk_pagemax_reduced or has_cuda_qk_pagemax))
+        ):
             return None
         if self.active_starts is None:
             return None
@@ -2585,8 +2610,22 @@ class EchoTokenPrefetchRuntime:
             tok_begin = int(self.sink_len + p0 * self.page_size)
             tok_end = int(tok_begin + p_count * self.page_size)
 
+            local_best_chunk = None
             qh_best = None
-            if has_cuda_qk_pagemax:
+            if has_cuda_qk_pagemax_reduced:
+                try:
+                    local_best_chunk = kernels.echo_decode_qk_scores_pagemax_chunk_reduced(
+                        q_compact,
+                        local_k,
+                        scores,
+                        self.n_q_per_kv,
+                        tok_begin,
+                        self.page_size,
+                        p_count,
+                    )
+                except Exception:
+                    local_best_chunk = None
+            if local_best_chunk is None and has_cuda_qk_pagemax:
                 try:
                     qh_best = kernels.echo_decode_qk_scores_pagemax_chunk(
                         q_compact,
@@ -2600,7 +2639,7 @@ class EchoTokenPrefetchRuntime:
                 except Exception:
                     qh_best = None
 
-            if qh_best is None:
+            if local_best_chunk is None and qh_best is None:
                 chunk_scores, qh_best = _triton_flash_decode_qk_select(
                     q_compact,
                     local_k[:, :, tok_begin:tok_end],
@@ -2614,9 +2653,10 @@ class EchoTokenPrefetchRuntime:
                     return None
                 scores[:, :, tok_begin:tok_end].copy_(chunk_scores, non_blocking=True)
 
-            local_best_chunk = qh_best.view(
-                eff, self.n_kv_heads, self.n_q_per_kv, p_count
-            ).float().mean(dim=(1, 2)).round().to(torch.int32)
+            if local_best_chunk is None:
+                local_best_chunk = qh_best.view(
+                    eff, self.n_kv_heads, self.n_q_per_kv, p_count
+                ).float().mean(dim=(1, 2)).round().to(torch.int32)
             if use_gpu_starts:
                 local_best_full[:, p0 : p0 + p_count].copy_(
                     local_best_chunk, non_blocking=True

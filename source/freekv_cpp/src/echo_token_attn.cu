@@ -439,6 +439,42 @@ torch::Tensor echo_decode_qk_scores_pagemax_chunk(
   return out_best;
 }
 
+torch::Tensor echo_decode_qk_scores_pagemax_chunk_reduced(
+    const torch::Tensor &q,
+    const torch::Tensor &k,
+    torch::Tensor scores,
+    int64_t n_q_per_kv,
+    int64_t token_begin,
+    int64_t page_size,
+    int64_t page_count) {
+  auto out_qh = echo_decode_qk_scores_pagemax_chunk(
+      q, k, scores, n_q_per_kv, token_begin, page_size, page_count);
+  auto out_best = torch::empty(
+      {q.size(0), page_count},
+      torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
+
+  constexpr int THREADS = 128;
+  const int64_t total = q.size(0) * page_count;
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  echo_reduce_qh_best_mean_kernel<THREADS>
+      <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
+          out_qh.data_ptr<int32_t>(),
+          out_best.data_ptr<int32_t>(),
+          out_qh.stride(0),
+          out_qh.stride(1),
+          out_qh.stride(2),
+          out_best.stride(0),
+          out_best.stride(1),
+          q.size(1),
+          page_count);
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(
+      err == cudaSuccess,
+      "echo_decode_qk_scores_pagemax_chunk_reduced launch failed: ",
+      cudaGetErrorString(err));
+  return out_best;
+}
+
 torch::Tensor echo_decode_qk_pagemax_chunk_only(
     const torch::Tensor &q,
     const torch::Tensor &k,
