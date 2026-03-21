@@ -159,6 +159,8 @@ def parse_args(args=None):
                         help="Force disable A100 Triton dense recall path")
     parser.add_argument("--echo_disable_a100_sdpa_attn", action="store_true",
                         help="Disable A100 SDPA attention fast path (enabled by default)")
+    parser.add_argument("--echo_disable_cuda_chunk_attn_a100", action="store_true",
+                        help="Disable A100 CUDA chunk-attn path (enabled by default)")
     parser.add_argument("--echo_allow_flash_fallback", action="store_true",
                         help="Allow fallback when Triton flash path is unavailable")
     parser.add_argument("--disable_profile_timing", action="store_true",
@@ -194,6 +196,7 @@ def load_model_and_tokenizer(path):
         args.echo_enable_triton_recall_a100 and (not args.echo_disable_triton_recall_a100)
     )
     use_a100_sdpa_attn = bool(not args.echo_disable_a100_sdpa_attn)
+    use_cuda_chunk_attn_a100 = bool(not args.echo_disable_cuda_chunk_attn_a100)
     print(f"\n{CYAN}{SEP}")
     print(f"  KV Cache Config: token_budget={token_budgets}, page_budget={page_budgets}, "
           f"page_size={page_size}, sink={args.sink}, recent={args.recent}, "
@@ -214,6 +217,7 @@ def load_model_and_tokenizer(path):
            f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
            f"triton_recall_a100={use_triton_recall_a100}, "
            f"a100_sdpa_attn={use_a100_sdpa_attn}, "
+           f"cuda_chunk_attn_a100={use_cuda_chunk_attn_a100}, "
            f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
@@ -256,6 +260,7 @@ def load_model_and_tokenizer(path):
             echo_use_triton_flash_attn=(not args.echo_disable_triton_flash_attn),
             echo_use_triton_recall_a100=use_triton_recall_a100,
             echo_use_a100_sdpa_attn=use_a100_sdpa_attn,
+            echo_prefer_cuda_chunk_attn_a100=use_cuda_chunk_attn_a100,
             echo_require_triton_flash=(not args.echo_allow_flash_fallback),
             profile_timing=(not args.disable_profile_timing),
         )

@@ -202,6 +202,9 @@ class InferState:
         self.echo_use_a100_sdpa_attn = bool(
             kwargs.get("echo_use_a100_sdpa_attn", True)
         )
+        self.echo_prefer_cuda_chunk_attn_a100 = bool(
+            kwargs.get("echo_prefer_cuda_chunk_attn_a100", True)
+        )
         self.echo_allow_anchor_overlap = bool(
             kwargs.get("echo_allow_anchor_overlap", True)
         )
@@ -360,6 +363,7 @@ class InferState:
                     full_fast_pages_threshold=self.echo_full_fast_pages_threshold,
                     use_triton_recall_a100=self.echo_use_triton_recall_a100,
                     use_a100_sdpa_attn=self.echo_use_a100_sdpa_attn,
+                    prefer_cuda_chunk_attn_a100=self.echo_prefer_cuda_chunk_attn_a100,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -925,7 +929,12 @@ class InferState:
                 self._perf_stop("pack", pack_t0)
 
                 stream_prefetch_ready = False
-                if rt.stream_prefetch_only:
+                force_cuda_chunk_attn = bool(
+                    hasattr(rt, "should_force_cuda_chunk_attn")
+                    and rt.should_force_cuda_chunk_attn()
+                )
+                use_stream_prefetch_only = bool(rt.stream_prefetch_only and (not force_cuda_chunk_attn))
+                if use_stream_prefetch_only:
                     a100_serial_inplace = bool(
                         rt.a100_fast_prefetch
                         and (getattr(rt, "_is_a100", False) or getattr(rt, "_sm", 0) == 80)

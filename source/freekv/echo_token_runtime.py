@@ -985,6 +985,7 @@ class EchoTokenPrefetchRuntime:
         full_fast_pages_threshold: int = 64,
         use_triton_recall_a100: bool = True,
         use_a100_sdpa_attn: bool = True,
+        prefer_cuda_chunk_attn_a100: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -1013,6 +1014,7 @@ class EchoTokenPrefetchRuntime:
         self.full_fast_pages_threshold = int(max(1, full_fast_pages_threshold))
         self.use_triton_recall_a100 = bool(use_triton_recall_a100 and (triton is not None))
         self.use_a100_sdpa_attn = bool(use_a100_sdpa_attn)
+        self.prefer_cuda_chunk_attn_a100 = bool(prefer_cuda_chunk_attn_a100)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -1077,10 +1079,12 @@ class EchoTokenPrefetchRuntime:
         self._a100_fast_reported = False
         self._a100_triton_recall_reported = False
         self._a100_sdpa_attn_reported = False
+        self._a100_cuda_chunk_attn_reported = False
         self._a100_attn_backend: Optional[str] = None
         self._a100_attn_backend_reported = False
         self._flash_attn_pkg_needs_contig: Optional[bool] = None
         self._flash_attn_pkg_needs_repeat: Optional[bool] = None
+        self._score_cache_buf: Optional[torch.Tensor] = None
 
     def _ensure_dense_gpu_buffers(self, need_tokens: int):
         if need_tokens <= 0:
@@ -1282,12 +1286,44 @@ class EchoTokenPrefetchRuntime:
         self._a100_fast_reported = False
         self._a100_triton_recall_reported = False
         self._a100_sdpa_attn_reported = False
+        self._a100_cuda_chunk_attn_reported = False
         self._a100_attn_backend = None
         self._a100_attn_backend_reported = False
         self._flash_attn_pkg_needs_contig = None
         self._flash_attn_pkg_needs_repeat = None
+        self._score_cache_buf = None
         self.dense_len = 0
         self.cpu_synced_len = 0
+
+    def should_force_cuda_chunk_attn(self) -> bool:
+        enabled = bool(
+            self.prefer_cuda_chunk_attn_a100 and (self._is_a100 or self._sm == 80)
+        )
+        if enabled and (not self._a100_cuda_chunk_attn_reported):
+            self._a100_cuda_chunk_attn_reported = True
+            print(
+                "[EchoKV] A100 CUDA chunk-attn mode enabled: "
+                "qk_chunk->anchor->recall(overlap)->pv"
+            )
+        return enabled
+
+    def _acquire_score_cache(
+        self, eff: int, device: torch.device
+    ) -> torch.Tensor:
+        need_shape = (int(eff), int(self.n_qo_heads), int(self.local_total_cap))
+        if (
+            self._score_cache_buf is None
+            or tuple(self._score_cache_buf.shape) != need_shape
+            or self._score_cache_buf.device != device
+            or self._score_cache_buf.dtype != torch.float32
+        ):
+            self._score_cache_buf = torch.empty(
+                need_shape,
+                dtype=torch.float32,
+                device=device,
+            )
+        self._score_cache_buf.fill_(-float("inf"))
+        return self._score_cache_buf
 
     def bootstrap_anchors_from_cpu(self, q: torch.Tensor, seq_len: int) -> bool:
         # Used when prompt is short and middle bounds become valid only after
@@ -2335,12 +2371,7 @@ class EchoTokenPrefetchRuntime:
         qh_best = None
         if has_cuda_qk_chunk and has_cuda_qk_pagemax:
             try:
-                scores = torch.full(
-                    (q_compact.shape[0], self.n_qo_heads, self.local_total_cap),
-                    -float("inf"),
-                    dtype=torch.float32,
-                    device=q_compact.device,
-                )
+                scores = self._acquire_score_cache(q_compact.shape[0], q_compact.device)
                 seq_len = int(local_k.shape[2])
                 kernels.echo_decode_qk_scores_chunk(
                     q_compact,
@@ -2440,12 +2471,7 @@ class EchoTokenPrefetchRuntime:
         if max_start < lower:
             return None
 
-        scores = torch.full(
-            (eff, self.n_qo_heads, self.local_total_cap),
-            -float("inf"),
-            dtype=torch.float32,
-            device=q_compact.device,
-        )
+        scores = self._acquire_score_cache(eff, q_compact.device)
 
         # Fill sink segment scores first (no recall dependency).
         self._fill_qk_scores_segment(scores, q_compact, local_k, 0, self.sink_len)
