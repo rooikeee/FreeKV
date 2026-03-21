@@ -145,12 +145,16 @@ def parse_args(args=None):
     parser.add_argument("--echo_no_shared_batch", dest="echo_shared_batch", action="store_false",
                         help="Disable shared-batch optimization for EchoKV-token")
     parser.set_defaults(echo_shared_batch=True)
+    parser.add_argument("--echo_disable_shared_decode_full_model", action="store_true",
+                        help="Disable decode-time single-sample full-model execution under shared_batch")
     parser.add_argument("--echo_disable_cuda_token_recall", action="store_true",
                         help="Force disable custom cuda token-recall kernel")
     parser.add_argument("--echo_disable_triton_qk_select", action="store_true",
                         help="Disable Triton QK page-argmax selector for EchoKV-token")
     parser.add_argument("--echo_disable_triton_flash_attn", action="store_true",
                         help="Disable Triton fused decode-attention(+anchor) for EchoKV-token")
+    parser.add_argument("--echo_disable_triton_recall_a100", action="store_true",
+                        help="Disable A100-oriented Triton dense recall path")
     parser.add_argument("--echo_allow_flash_fallback", action="store_true",
                         help="Allow fallback when Triton flash path is unavailable")
     parser.add_argument("--disable_profile_timing", action="store_true",
@@ -188,6 +192,7 @@ def load_model_and_tokenizer(path):
           f"echo_anchor_pages={echo_anchor_pages}, echo_anchor_tokens={echo_anchor_tokens}")
     print(f"  Echo Config: sel_policy={args.sel_policy}, seed_anchors={args.echo_num_anchors}, "
           f"shared_batch={args.echo_shared_batch}, anchor_head_sample={args.echo_anchor_head_sample}, "
+          f"shared_decode_full_model={(not args.echo_disable_shared_decode_full_model)}, "
           f"attn_backend={args.echo_attn_backend}, "
           f"flash_mode={args.echo_flash_mode}, "
           f"stream_chunk_pages={args.echo_stream_chunk_pages}, "
@@ -199,6 +204,7 @@ def load_model_and_tokenizer(path):
           f"native_only={(not args.echo_disable_native_only)}, "
           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
           f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
+          f"triton_recall_a100={(not args.echo_disable_triton_recall_a100)}, "
           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
@@ -233,9 +239,15 @@ def load_model_and_tokenizer(path):
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
             echo_native_only=(not args.echo_disable_native_only),
             echo_shared_batch=args.echo_shared_batch,
+            echo_shared_decode_full_model=(
+                not args.echo_disable_shared_decode_full_model
+            ),
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             echo_use_triton_qk_select=(not args.echo_disable_triton_qk_select),
             echo_use_triton_flash_attn=(not args.echo_disable_triton_flash_attn),
+            echo_use_triton_recall_a100=(
+                not args.echo_disable_triton_recall_a100
+            ),
             echo_require_triton_flash=(not args.echo_allow_flash_fallback),
             profile_timing=(not args.disable_profile_timing),
         )

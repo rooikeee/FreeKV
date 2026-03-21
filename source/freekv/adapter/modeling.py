@@ -58,20 +58,44 @@ def get_corr_torch_compile(
     need_corr = torch.any(to_corr)
     return to_corr, need_corr
 
+def _use_echo_shared_decode_fastpath(infer_state: InferState, x: torch.Tensor) -> bool:
+    if x is None or x.dim() != 3:
+        return False
+    return bool(
+        getattr(infer_state, "echo_token", False)
+        and getattr(infer_state, "echo_native_only", False)
+        and getattr(infer_state, "echo_shared_batch", False)
+        and getattr(infer_state, "echo_shared_decode_full_model", True)
+        and x.size(0) > 1
+        and x.size(1) == 1
+    )
+
 def _freekv_rms_norm_forward_streamed(self: LlamaRMSNorm, hidden_states, infer_state: InferState):
+    fast_shared = _use_echo_shared_decode_fastpath(infer_state, hidden_states)
+    in_states = hidden_states[:1] if fast_shared else hidden_states
     with torch.cuda.stream(infer_state.compute_stream):
-        output = kernels.rms_norm(hidden_states, self.weight, self.variance_epsilon)
+        output = kernels.rms_norm(in_states, self.weight, self.variance_epsilon)
+    if fast_shared:
+        output = output.expand(hidden_states.size(0), -1, -1)
     return output
 
 def _mlp_forward_streamed(self, original_fwd, hidden_states, infer_state: InferState):
     # Use compute_stream only if spec_ret is active and pool initialized
+    fast_shared = _use_echo_shared_decode_fastpath(infer_state, hidden_states)
+    in_states = hidden_states[:1] if fast_shared else hidden_states
     with torch.cuda.stream(infer_state.compute_stream):
-        output = original_fwd(hidden_states) # Call original MLP forward
+        output = original_fwd(in_states) # Call original MLP forward
+    if fast_shared:
+        output = output.expand(hidden_states.size(0), -1, -1)
     return output
 
 def _lm_head_forward_streamed(x, original_lm_head_forward, infer_state: InferState):
+    fast_shared = _use_echo_shared_decode_fastpath(infer_state, x)
+    x_in = x[:1] if fast_shared else x
     with torch.cuda.stream(infer_state.compute_stream):
-        logits = original_lm_head_forward(x[:, -1:, :])
+        logits = original_lm_head_forward(x_in[:, -1:, :])
+    if fast_shared:
+        logits = logits.expand(x.size(0), -1, -1)
     return logits
 
 def _freekv_attn_forward(
@@ -95,29 +119,41 @@ def _freekv_attn_forward(
         if cur_id == 0:
             state.begin_forward(bsz, q_len)
 
-        torch.cuda.nvtx.range_push(f"qkv_proj")
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-        torch.cuda.nvtx.range_pop()
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(
-            bsz, q_len, self.num_key_value_heads, self.head_dim
-        )
-
         kvc = state.kv_caches[cur_id]
         budget = state.layer2budget[cur_id]
+        fast_shared_decode = bool(
+            q_len == 1
+            and budget is not None
+            and _use_echo_shared_decode_fastpath(state, hidden_states)
+        )
+        hs_qkv = hidden_states[:1] if fast_shared_decode else hidden_states
+        qkv_bsz = hs_qkv.shape[0]
+
+        torch.cuda.nvtx.range_push(f"qkv_proj")
+        query_states = self.q_proj(hs_qkv)
+        key_states = self.k_proj(hs_qkv)
+        value_states = self.v_proj(hs_qkv)
+        torch.cuda.nvtx.range_pop()
+
+        query_states = query_states.view(qkv_bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(qkv_bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(
+            qkv_bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
 
         torch.cuda.nvtx.range_push(f"RoPE")
+        rope_indptr = state.rope_indptr
+        rope_offsets = state.rope_offsets
+        if fast_shared_decode:
+            rope_indptr = rope_indptr[:2]
+            rope_offsets = rope_offsets[:1]
         if self.config.rope_scaling is not None:
             assert self.config.rope_scaling["rope_type"] == "llama3"
             apply_llama31_rope_inplace(
-                query_states.view(bsz*q_len, self.num_heads, self.head_dim),
-                key_states.view(bsz*q_len, self.num_key_value_heads, self.head_dim),
-                state.rope_indptr,
-                state.rope_offsets,
+                query_states.view(qkv_bsz * q_len, self.num_heads, self.head_dim),
+                key_states.view(qkv_bsz * q_len, self.num_key_value_heads, self.head_dim),
+                rope_indptr,
+                rope_offsets,
                 rope_scale=self.config.rope_scaling["factor"],
                 rope_theta=self.config.rope_theta,
                 low_freq_factor=self.config.rope_scaling["low_freq_factor"],
@@ -125,10 +161,10 @@ def _freekv_attn_forward(
             )
         else:
             apply_rope_inplace(
-                query_states.view(bsz*q_len, self.num_heads, self.head_dim),
-                key_states.view(bsz*q_len, self.num_key_value_heads, self.head_dim),
-                state.rope_indptr,
-                state.rope_offsets,
+                query_states.view(qkv_bsz * q_len, self.num_heads, self.head_dim),
+                key_states.view(qkv_bsz * q_len, self.num_key_value_heads, self.head_dim),
+                rope_indptr,
+                rope_offsets,
                 rope_scale=1.0,
                 rope_theta=self.config.rope_theta,
             )
@@ -254,10 +290,15 @@ def _freekv_attn_forward(
                 # not reach the budget
                 attn_output = state.decode_sdpa(cur_id, query_states, attn_page_ids)
 
+        if fast_shared_decode and attn_output.shape[0] == 1 and bsz > 1:
+            attn_output = attn_output.expand(bsz, -1, -1, -1)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
         torch.cuda.nvtx.range_push("oproj")
-        attn_output = self.o_proj(attn_output)
+        if fast_shared_decode and bsz > 1:
+            attn_output = self.o_proj(attn_output[:1]).expand(bsz, -1, -1)
+        else:
+            attn_output = self.o_proj(attn_output)
         torch.cuda.nvtx.range_pop()
 
         if not output_attentions:

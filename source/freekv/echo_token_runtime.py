@@ -422,6 +422,60 @@ if triton is not None:
         tl.store(o_ptrs, out, mask=mask_d)
 
 
+if triton is not None:
+    @triton.jit
+    def _echo_recall_dense_linear_kernel(
+        src_ptr,         # [b, h, src_t, d]
+        dst_ptr,         # [b, h, dst_t, d]
+        starts_ptr,      # [b, n_pages], int32
+        stride_src_b,
+        stride_src_h,
+        stride_src_t,
+        stride_src_d,
+        stride_dst_b,
+        stride_dst_h,
+        stride_dst_t,
+        stride_dst_d,
+        stride_st_b,
+        stride_st_p,
+        n_kv_heads,
+        page_size,
+        head_dim,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_d = tl.program_id(0)
+        pid_t = tl.program_id(1)
+        pid_bh = tl.program_id(2)
+
+        b = pid_bh // n_kv_heads
+        h = pid_bh - b * n_kv_heads
+
+        p = pid_t // page_size
+        t_off = pid_t - p * page_size
+        start = tl.load(starts_ptr + b * stride_st_b + p * stride_st_p).to(tl.int32)
+        src_t = start + t_off
+
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask_d = offs_d < head_dim
+
+        src_ptrs = (
+            src_ptr
+            + b * stride_src_b
+            + h * stride_src_h
+            + src_t * stride_src_t
+            + offs_d * stride_src_d
+        )
+        dst_ptrs = (
+            dst_ptr
+            + b * stride_dst_b
+            + h * stride_dst_h
+            + pid_t * stride_dst_t
+            + offs_d * stride_dst_d
+        )
+        v = tl.load(src_ptrs, mask=mask_d, other=0.0)
+        tl.store(dst_ptrs, v, mask=mask_d)
+
+
 def _triton_qk_page_argmax(
     grouped_q: torch.Tensor,
     mid: torch.Tensor,
@@ -822,6 +876,78 @@ def _triton_flash_decode_attn_plain(
     return out
 
 
+def _triton_recall_dense_linear(
+    starts_i32: torch.Tensor,   # [b, n_pages], int32, cuda
+    src_hsd: torch.Tensor,      # [b, n_kv_heads, src_t, d], cuda
+    dst_hsd: torch.Tensor,      # [b, n_kv_heads, dst_t, d], cuda
+    page_size: int,
+) -> bool:
+    if triton is None:
+        return False
+    if (
+        starts_i32.device.type != "cuda"
+        or src_hsd.device.type != "cuda"
+        or dst_hsd.device.type != "cuda"
+    ):
+        return False
+    if starts_i32.dtype != torch.int32:
+        return False
+    if src_hsd.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    if dst_hsd.dtype != src_hsd.dtype:
+        return False
+    if starts_i32.dim() != 2 or src_hsd.dim() != 4 or dst_hsd.dim() != 4:
+        return False
+    if page_size <= 0:
+        return False
+
+    bsz, n_pages = starts_i32.shape
+    b2, n_kv_heads, src_t, head_dim = src_hsd.shape
+    b3, h3, dst_t, d3 = dst_hsd.shape
+    if bsz != b2 or b2 != b3:
+        return False
+    if n_kv_heads != h3:
+        return False
+    if head_dim != d3:
+        return False
+    if dst_t != n_pages * page_size:
+        return False
+    if src_t <= 0 or head_dim <= 0:
+        return False
+
+    starts_c = starts_i32 if starts_i32.is_contiguous() else starts_i32.contiguous()
+    src_c = src_hsd if src_hsd.is_contiguous() else src_hsd.contiguous()
+    # dst_hsd may be strided view; keep original to avoid extra copy.
+    dst = dst_hsd
+
+    block_d = 64 if head_dim <= 64 else 128
+    if block_d < head_dim and head_dim > 128:
+        block_d = 256
+    num_warps = 2 if block_d <= 64 else 4
+    grid = (triton.cdiv(head_dim, block_d), dst_t, bsz * n_kv_heads)
+    _echo_recall_dense_linear_kernel[grid](
+        src_c,
+        dst,
+        starts_c,
+        src_c.stride(0),
+        src_c.stride(1),
+        src_c.stride(2),
+        src_c.stride(3),
+        dst.stride(0),
+        dst.stride(1),
+        dst.stride(2),
+        dst.stride(3),
+        starts_c.stride(0),
+        starts_c.stride(1),
+        n_kv_heads,
+        page_size,
+        head_dim,
+        BLOCK_D=block_d,
+        num_warps=num_warps,
+    )
+    return True
+
+
 class EchoTokenPrefetchRuntime:
     """
     Token-wise EchoKV runtime:
@@ -857,6 +983,7 @@ class EchoTokenPrefetchRuntime:
         lazy_cpu_copy: bool = True,
         reduce_host_sync: bool = True,
         full_fast_pages_threshold: int = 64,
+        use_triton_recall_a100: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -883,6 +1010,7 @@ class EchoTokenPrefetchRuntime:
         self.lazy_cpu_copy = bool(lazy_cpu_copy)
         self.reduce_host_sync = bool(reduce_host_sync)
         self.full_fast_pages_threshold = int(max(1, full_fast_pages_threshold))
+        self.use_triton_recall_a100 = bool(use_triton_recall_a100 and (triton is not None))
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -1702,6 +1830,81 @@ class EchoTokenPrefetchRuntime:
                     non_blocking=True,
                 )
 
+    def _triton_recall_from_dense(
+        self,
+        starts_i32: torch.Tensor,
+        out_buf: torch.Tensor,
+        page_begin: int = 0,
+        page_count: Optional[int] = None,
+    ) -> bool:
+        # A100-oriented path: recall directly from dense GPU KV cache to avoid
+        # CPU pinned-memory H2D memcpy in decode prefetch.
+        if not self.use_triton_recall_a100:
+            return False
+        if (not self._is_a100) and self._sm != 80:
+            return False
+        if self.dense_k is None or self.dense_v is None:
+            return False
+        if int(self.dense_len) < int(self.cpu_len):
+            return False
+        if starts_i32 is None or starts_i32.dim() != 2:
+            return False
+        if page_count is None:
+            page_count = int(self.mid_pages - page_begin)
+        page_begin = int(page_begin)
+        page_count = int(page_count)
+        if page_begin < 0 or page_count < 0:
+            return False
+        if page_count == 0:
+            return True
+        if page_begin + page_count > int(self.mid_pages):
+            return False
+        if starts_i32.shape[1] != int(self.mid_pages):
+            return False
+        if starts_i32.shape[0] not in (1, int(self.eff_batch)):
+            return False
+
+        starts_dev = starts_i32
+        if starts_dev.device.type != "cuda":
+            starts_dev = starts_dev.to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+        elif starts_dev.dtype != torch.int32:
+            starts_dev = starts_dev.to(dtype=torch.int32)
+        if not starts_dev.is_contiguous():
+            starts_dev = starts_dev.contiguous()
+
+        if starts_dev.shape[0] == 1 and self.eff_batch > 1:
+            starts_dev = starts_dev.expand(self.eff_batch, -1).contiguous()
+
+        p1 = int(page_begin + page_count)
+        starts_slice = starts_dev[:, page_begin:p1]
+        if not starts_slice.is_contiguous():
+            starts_slice = starts_slice.contiguous()
+        tok0 = int(page_begin * self.page_size)
+        tok1 = int(p1 * self.page_size)
+
+        src_k = self.dense_k[: self.eff_batch, :, : self.cpu_len]
+        src_v = self.dense_v[: self.eff_batch, :, : self.cpu_len]
+        dst_k = out_buf[:, tok0:tok1, 0].permute(0, 2, 1, 3)
+        dst_v = out_buf[:, tok0:tok1, 1].permute(0, 2, 1, 3)
+
+        ok_k = _triton_recall_dense_linear(
+            starts_slice,
+            src_k,
+            dst_k,
+            self.page_size,
+        )
+        if not ok_k:
+            return False
+        ok_v = _triton_recall_dense_linear(
+            starts_slice,
+            src_v,
+            dst_v,
+            self.page_size,
+        )
+        return bool(ok_v)
+
     def _fill_qk_scores_segment(
         self,
         scores: torch.Tensor,       # [eff, n_q_heads, max_tokens], float32
@@ -1792,8 +1995,18 @@ class EchoTokenPrefetchRuntime:
         out_buf = self.gpu_mid[pending_idx]
 
         with torch.cuda.stream(self.recall_stream):
+            used_triton = False
+            try:
+                used_triton = self._triton_recall_from_dense(
+                    starts_i32,
+                    out_buf,
+                )
+            except Exception:
+                used_triton = False
             used_delta = False
             if (
+                (not used_triton)
+                and
                 allow_inplace_delta
                 and self.active_starts is not None
                 and self.use_cuda_token_recall
@@ -1816,6 +2029,7 @@ class EchoTokenPrefetchRuntime:
                     used_delta = False
             if (
                 (not used_delta)
+                and (not used_triton)
                 and allow_inplace_delta
                 and self.active_starts is not None
                 and self.use_cuda_token_recall
@@ -1834,7 +2048,7 @@ class EchoTokenPrefetchRuntime:
                 except Exception:
                     used_delta = False
 
-            if (not used_delta) and allow_inplace_delta and self.active_starts is not None:
+            if (not used_triton) and (not used_delta) and allow_inplace_delta and self.active_starts is not None:
                 # Fallback path when delta kernel is unavailable.
                 used_delta = self._delta_recall_from_active(
                     starts_cpu, self.gpu_mid[self.active_idx], in_place=True
@@ -1844,7 +2058,12 @@ class EchoTokenPrefetchRuntime:
                     out_buf = self.gpu_mid[pending_idx]
 
             used_cuda = False
-            if (not used_delta) and self.use_cuda_token_recall and hasattr(kernels, "recall_tokens_linear"):
+            if (
+                (not used_triton)
+                and (not used_delta)
+                and self.use_cuda_token_recall
+                and hasattr(kernels, "recall_tokens_linear")
+            ):
                 try:
                     kernels.recall_tokens_linear(
                         starts_i32,
@@ -1855,7 +2074,7 @@ class EchoTokenPrefetchRuntime:
                     used_cuda = True
                 except Exception:
                     used_cuda = False
-            if (not used_delta) and (not used_cuda):
+            if (not used_triton) and (not used_delta) and (not used_cuda):
                 self._fallback_recall(starts_cpu, out_buf)
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
@@ -2497,25 +2716,34 @@ class EchoTokenPrefetchRuntime:
                         ),
                         non_blocking=False,
                     )
-                if has_delta_full and self.active_starts is not None:
-                    kernels.recall_tokens_delta_linear(
-                        starts_dev,
-                        prev_starts_dev,
-                        self.cpu_kv[: self.eff_batch],
-                        self.gpu_mid[self.active_idx],
+                used_triton_full = False
+                try:
+                    used_triton_full = self._triton_recall_from_dense(
+                        starts_full,
                         out_buf,
-                        self.cpu_len,
                     )
-                elif has_linear_full:
-                    kernels.recall_tokens_linear(
-                        starts_dev,
-                        self.cpu_kv[: self.eff_batch],
-                        out_buf,
-                        self.cpu_len,
-                    )
-                else:
-                    # Should not happen due to use_full_fast guard.
-                    self._fallback_recall(starts_dev, out_buf)
+                except Exception:
+                    used_triton_full = False
+                if not used_triton_full:
+                    if has_delta_full and self.active_starts is not None:
+                        kernels.recall_tokens_delta_linear(
+                            starts_dev,
+                            prev_starts_dev,
+                            self.cpu_kv[: self.eff_batch],
+                            self.gpu_mid[self.active_idx],
+                            out_buf,
+                            self.cpu_len,
+                        )
+                    elif has_linear_full:
+                        kernels.recall_tokens_linear(
+                            starts_dev,
+                            self.cpu_kv[: self.eff_batch],
+                            out_buf,
+                            self.cpu_len,
+                        )
+                    else:
+                        # Should not happen due to use_full_fast guard.
+                        self._fallback_recall(starts_dev, out_buf)
             else:
                 for p0 in range(0, self.mid_pages, chunk_pages):
                     p_count = int(min(chunk_pages, self.mid_pages - p0))

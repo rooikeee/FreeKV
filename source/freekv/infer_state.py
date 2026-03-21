@@ -184,6 +184,9 @@ class InferState:
         self.echo_native_only = bool(kwargs.get("echo_native_only", True))
         self.echo_num_anchors = int(kwargs.get("echo_num_anchors", 64))
         self.echo_shared_batch = bool(kwargs.get("echo_shared_batch", True))
+        self.echo_shared_decode_full_model = bool(
+            kwargs.get("echo_shared_decode_full_model", True)
+        )
         self.echo_use_cuda_token_recall = bool(
             kwargs.get("echo_use_cuda_token_recall", True)
         )
@@ -192,6 +195,9 @@ class InferState:
         )
         self.echo_use_triton_flash_attn = bool(
             kwargs.get("echo_use_triton_flash_attn", True)
+        )
+        self.echo_use_triton_recall_a100 = bool(
+            kwargs.get("echo_use_triton_recall_a100", True)
         )
         self.echo_allow_anchor_overlap = bool(
             kwargs.get("echo_allow_anchor_overlap", True)
@@ -349,6 +355,7 @@ class InferState:
                     lazy_cpu_copy=self.echo_lazy_cpu_copy,
                     reduce_host_sync=self.echo_reduce_host_sync,
                     full_fast_pages_threshold=self.echo_full_fast_pages_threshold,
+                    use_triton_recall_a100=self.echo_use_triton_recall_a100,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
