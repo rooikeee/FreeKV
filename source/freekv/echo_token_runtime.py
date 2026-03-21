@@ -1073,6 +1073,7 @@ class EchoTokenPrefetchRuntime:
         self._is_a100 = False
         self._sm = 0
         self._a100_fast_reported = False
+        self._a100_triton_recall_reported = False
 
     def _ensure_dense_gpu_buffers(self, need_tokens: int):
         if need_tokens <= 0:
@@ -1182,6 +1183,16 @@ class EchoTokenPrefetchRuntime:
             self._sm = int(props.major * 10 + props.minor)
             name = str(getattr(props, "name", "")).lower()
             self._is_a100 = "a100" in name
+            if (
+                self.use_triton_recall_a100
+                and (self._is_a100 or self._sm == 80)
+                and (not self._a100_triton_recall_reported)
+            ):
+                self._a100_triton_recall_reported = True
+                print(
+                    "[EchoKV] A100 Triton recall enabled: "
+                    f"sm={self._sm}, mid_pages={self.mid_pages}"
+                )
 
         if self.recall_stream is None:
             self.recall_stream = torch.cuda.Stream(device)
@@ -1262,6 +1273,7 @@ class EchoTokenPrefetchRuntime:
         self.page_ids_bsz = 0
         self._head_idx = None
         self._a100_fast_reported = False
+        self._a100_triton_recall_reported = False
         self.dense_len = 0
         self.cpu_synced_len = 0
 
@@ -2391,7 +2403,10 @@ class EchoTokenPrefetchRuntime:
 
         has_delta_partial = hasattr(kernels, "recall_tokens_delta_linear_partial")
         has_linear_partial = hasattr(kernels, "recall_tokens_linear_partial")
-        if (not has_delta_partial) and (not has_linear_partial):
+        can_triton_recall = bool(
+            self.use_triton_recall_a100 and (self._is_a100 or self._sm == 80)
+        )
+        if (not has_delta_partial) and (not has_linear_partial) and (not can_triton_recall):
             return None
 
         bsz = q.shape[0]
@@ -2423,17 +2438,26 @@ class EchoTokenPrefetchRuntime:
         # Fill sink segment scores first (no recall dependency).
         self._fill_qk_scores_segment(scores, q_compact, local_k, 0, self.sink_len)
 
-        starts_full = self.active_starts.to(
-            device=torch.device("cpu"), dtype=torch.int32
-        ).clone()
+        active_starts_cpu = self.active_starts
+        if (
+            active_starts_cpu.device.type != "cpu"
+            or active_starts_cpu.dtype != torch.int32
+            or (not active_starts_cpu.is_contiguous())
+        ):
+            active_starts_cpu = active_starts_cpu.to(
+                device=torch.device("cpu"), dtype=torch.int32
+            ).contiguous()
+        starts_full_gpu = active_starts_cpu.to(
+            device=q_compact.device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        starts_full_cpu = None
         local_best_full = torch.empty(
             (eff, self.mid_pages), dtype=torch.int32, device=torch.device("cpu")
         )
 
         pending_idx = 1 - self.active_idx
         out_buf = self.gpu_mid[pending_idx]
-        starts_dev = starts_full
-        prev_starts_dev = self.active_starts
+        prev_starts_dev = active_starts_cpu
 
         chunk_pages = int(max(1, min(self.stream_chunk_pages, self.mid_pages)))
         for p0 in range(0, self.mid_pages, chunk_pages):
@@ -2478,19 +2502,19 @@ class EchoTokenPrefetchRuntime:
             )
             local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
 
-            starts_chunk = self.active_starts[:, p0 : p0 + p_count] + local_best_chunk_cpu
-            starts_chunk = torch.clamp(
-                starts_chunk - int(self.slide_half_window),
+            starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
+            starts_chunk_gpu = torch.clamp(
+                starts_chunk_gpu - int(self.slide_half_window),
                 min=lower,
                 max=max_start,
             ).to(dtype=torch.int32)
-            starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
+            starts_full_gpu[:, p0 : p0 + p_count].copy_(starts_chunk_gpu, non_blocking=True)
 
             with torch.cuda.stream(self.recall_stream):
                 used_triton_partial = False
                 try:
                     used_triton_partial = self._triton_recall_from_dense(
-                        starts_full,
+                        starts_full_gpu,
                         out_buf,
                         p0,
                         p_count,
@@ -2501,9 +2525,21 @@ class EchoTokenPrefetchRuntime:
                 if used_triton_partial:
                     continue
 
+                if starts_full_cpu is None:
+                    starts_full_cpu = starts_full_gpu.to(
+                        device=torch.device("cpu"), dtype=torch.int32
+                    ).contiguous()
+                else:
+                    starts_full_cpu[:, p0 : p0 + p_count].copy_(
+                        starts_chunk_gpu.to(
+                            device=torch.device("cpu"), dtype=torch.int32
+                        ),
+                        non_blocking=False,
+                    )
+
                 if has_delta_partial and self.active_starts is not None:
                     kernels.recall_tokens_delta_linear_partial(
-                        starts_dev,
+                        starts_full_cpu,
                         prev_starts_dev,
                         self.cpu_kv[: self.eff_batch],
                         self.gpu_mid[self.active_idx],
@@ -2514,7 +2550,7 @@ class EchoTokenPrefetchRuntime:
                     )
                 elif has_linear_partial:
                     kernels.recall_tokens_linear_partial(
-                        starts_dev,
+                        starts_full_cpu,
                         self.cpu_kv[: self.eff_batch],
                         out_buf,
                         self.cpu_len,
@@ -2522,7 +2558,7 @@ class EchoTokenPrefetchRuntime:
                         p_count,
                     )
                 else:
-                    self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
+                    self._fallback_recall_partial(starts_full_cpu, out_buf, p0, p_count)
 
         # Fill window segment scores after middle chunk loop.
         self._fill_qk_scores_segment(
@@ -2537,7 +2573,11 @@ class EchoTokenPrefetchRuntime:
             device=torch.device("cpu"), dtype=torch.int32
         ).contiguous()
         self.anchors = anchors
-        self._set_prefetch_hint(starts_full, int(target_seq_len))
+        if starts_full_cpu is None:
+            starts_full_cpu = starts_full_gpu.to(
+                device=torch.device("cpu"), dtype=torch.int32
+            ).contiguous()
+        self._set_prefetch_hint(starts_full_cpu, int(target_seq_len))
 
         with torch.cuda.stream(self.recall_stream):
             self.pending_idx = pending_idx
@@ -2584,7 +2624,7 @@ class EchoTokenPrefetchRuntime:
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
-        self.pending_starts = starts_full
+        self.pending_starts = starts_full_cpu
         self.prefetch_ready = True
         return scores
 
@@ -2612,11 +2652,15 @@ class EchoTokenPrefetchRuntime:
         has_linear_partial = hasattr(kernels, "recall_tokens_linear_partial")
         has_delta_full = hasattr(kernels, "recall_tokens_delta_linear")
         has_linear_full = hasattr(kernels, "recall_tokens_linear")
+        can_triton_recall = bool(
+            self.use_triton_recall_a100 and (self._is_a100 or self._sm == 80)
+        )
         if (
             (not has_delta_partial)
             and (not has_linear_partial)
             and (not has_delta_full)
             and (not has_linear_full)
+            and (not can_triton_recall)
         ):
             return False
 
@@ -2653,11 +2697,13 @@ class EchoTokenPrefetchRuntime:
             active_starts_cpu = active_starts_cpu.to(
                 device=torch.device("cpu"), dtype=torch.int32
             ).contiguous()
-        starts_full = active_starts_cpu.clone()
+        starts_full_gpu = active_starts_cpu.to(
+            device=q_compact.device, dtype=torch.int32, non_blocking=True
+        ).contiguous()
+        starts_full_cpu = None
 
         pending_idx = self.active_idx if allow_inplace_delta else (1 - self.active_idx)
         out_buf = self.gpu_mid[pending_idx]
-        starts_dev = starts_full
         prev_starts_dev = active_starts_cpu
 
         cur_stream = torch.cuda.current_stream(self.device)
@@ -2671,9 +2717,10 @@ class EchoTokenPrefetchRuntime:
             self.reduce_host_sync
             and self.mid_pages <= int(self.full_fast_pages_threshold)
         )
+        has_full_recall = bool(has_delta_full or has_linear_full or can_triton_recall)
         use_full_fast = bool(
             (has_cuda_pagemax_only_reduced or has_cuda_pagemax_only)
-            and (has_delta_full or has_linear_full)
+            and has_full_recall
             and (use_a100_full_fast or use_hostsync_reduced_full)
         )
         if use_full_fast and (not self._a100_fast_reported):
@@ -2710,38 +2757,37 @@ class EchoTokenPrefetchRuntime:
                     ).float().mean(dim=(1, 2)).round().to(torch.int32)
                 if local_best_all is None:
                     return False
-                local_best_cpu = local_best_all.to(
-                    device=torch.device("cpu"), dtype=torch.int32
-                )
-                starts_full.copy_(
+                starts_full_gpu.copy_(
                     torch.clamp(
-                        active_starts_cpu + local_best_cpu - int(self.slide_half_window),
+                        starts_full_gpu + local_best_all - int(self.slide_half_window),
                         min=lower,
                         max=max_start,
                     ).to(dtype=torch.int32),
-                    non_blocking=False,
+                    non_blocking=True,
                 )
                 # A100 path: sort starts to improve contiguous run detection in
                 # recall memcpy scheduling (attention is permutation-invariant).
                 if use_a100_full_fast:
-                    starts_full.copy_(
-                        torch.sort(starts_full, dim=-1).values.to(
-                            device=torch.device("cpu"), dtype=torch.int32
-                        ),
-                        non_blocking=False,
+                    starts_full_gpu.copy_(
+                        torch.sort(starts_full_gpu, dim=-1).values.to(dtype=torch.int32),
+                        non_blocking=True,
                     )
                 used_triton_full = False
                 try:
                     used_triton_full = self._triton_recall_from_dense(
-                        starts_full,
+                        starts_full_gpu,
                         out_buf,
                     )
                 except Exception:
                     used_triton_full = False
                 if not used_triton_full:
+                    if starts_full_cpu is None:
+                        starts_full_cpu = starts_full_gpu.to(
+                            device=torch.device("cpu"), dtype=torch.int32
+                        ).contiguous()
                     if has_delta_full and self.active_starts is not None:
                         kernels.recall_tokens_delta_linear(
-                            starts_dev,
+                            starts_full_cpu,
                             prev_starts_dev,
                             self.cpu_kv[: self.eff_batch],
                             self.gpu_mid[self.active_idx],
@@ -2750,14 +2796,14 @@ class EchoTokenPrefetchRuntime:
                         )
                     elif has_linear_full:
                         kernels.recall_tokens_linear(
-                            starts_dev,
+                            starts_full_cpu,
                             self.cpu_kv[: self.eff_batch],
                             out_buf,
                             self.cpu_len,
                         )
                     else:
                         # Should not happen due to use_full_fast guard.
-                        self._fallback_recall(starts_dev, out_buf)
+                        self._fallback_recall(starts_full_cpu, out_buf)
             else:
                 for p0 in range(0, self.mid_pages, chunk_pages):
                     p_count = int(min(chunk_pages, self.mid_pages - p0))
@@ -2808,22 +2854,20 @@ class EchoTokenPrefetchRuntime:
                         local_best_chunk = qh_best.view(
                             eff, self.n_kv_heads, self.n_q_per_kv, p_count
                         ).float().mean(dim=(1, 2)).round().to(torch.int32)
-                    local_best_chunk_cpu = local_best_chunk.to(
-                        device=torch.device("cpu"), dtype=torch.int32
-                    )
-
-                    starts_chunk = active_starts_cpu[:, p0 : p0 + p_count] + local_best_chunk_cpu
-                    starts_chunk = torch.clamp(
-                        starts_chunk - int(self.slide_half_window),
+                    starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
+                    starts_chunk_gpu = torch.clamp(
+                        starts_chunk_gpu - int(self.slide_half_window),
                         min=lower,
                         max=max_start,
                     ).to(dtype=torch.int32)
-                    starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
+                    starts_full_gpu[:, p0 : p0 + p_count].copy_(
+                        starts_chunk_gpu, non_blocking=True
+                    )
 
                     used_triton_partial = False
                     try:
                         used_triton_partial = self._triton_recall_from_dense(
-                            starts_full,
+                            starts_full_gpu,
                             out_buf,
                             p0,
                             p_count,
@@ -2834,9 +2878,21 @@ class EchoTokenPrefetchRuntime:
                     if used_triton_partial:
                         continue
 
+                    if starts_full_cpu is None:
+                        starts_full_cpu = starts_full_gpu.to(
+                            device=torch.device("cpu"), dtype=torch.int32
+                        ).contiguous()
+                    else:
+                        starts_full_cpu[:, p0 : p0 + p_count].copy_(
+                            starts_chunk_gpu.to(
+                                device=torch.device("cpu"), dtype=torch.int32
+                            ),
+                            non_blocking=False,
+                        )
+
                     if has_delta_partial and self.active_starts is not None:
                         kernels.recall_tokens_delta_linear_partial(
-                            starts_dev,
+                            starts_full_cpu,
                             prev_starts_dev,
                             self.cpu_kv[: self.eff_batch],
                             self.gpu_mid[self.active_idx],
@@ -2847,7 +2903,7 @@ class EchoTokenPrefetchRuntime:
                         )
                     elif has_linear_partial:
                         kernels.recall_tokens_linear_partial(
-                            starts_dev,
+                            starts_full_cpu,
                             self.cpu_kv[: self.eff_batch],
                             out_buf,
                             self.cpu_len,
@@ -2855,13 +2911,20 @@ class EchoTokenPrefetchRuntime:
                             p_count,
                         )
                     else:
-                        self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
+                        self._fallback_recall_partial(
+                            starts_full_cpu, out_buf, p0, p_count
+                        )
 
-            anchors = (starts_full + int(self.slide_half_window)).to(
+            if starts_full_cpu is None:
+                starts_full_cpu = starts_full_gpu.to(
+                    device=torch.device("cpu"), dtype=torch.int32
+                ).contiguous()
+
+            anchors = (starts_full_cpu + int(self.slide_half_window)).to(
                 device=torch.device("cpu"), dtype=torch.int32
             ).contiguous()
             self.anchors = anchors
-            self._set_prefetch_hint(starts_full, int(target_seq_len))
+            self._set_prefetch_hint(starts_full_cpu, int(target_seq_len))
 
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
@@ -2907,7 +2970,7 @@ class EchoTokenPrefetchRuntime:
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
-        self.pending_starts = starts_full
+        self.pending_starts = starts_full_cpu
         self.prefetch_ready = True
         return True
 
