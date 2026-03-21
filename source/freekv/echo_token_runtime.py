@@ -936,6 +936,7 @@ class EchoTokenPrefetchRuntime:
         self._head_idx = None
         self._is_a100 = False
         self._sm = 0
+        self._a100_fast_reported = False
 
     def _ensure_dense_gpu_buffers(self, need_tokens: int):
         if need_tokens <= 0:
@@ -1079,6 +1080,7 @@ class EchoTokenPrefetchRuntime:
         self.page_ids = None
         self.page_ids_bsz = 0
         self._head_idx = None
+        self._a100_fast_reported = False
 
     def bootstrap_anchors_from_cpu(self, q: torch.Tensor, seq_len: int) -> bool:
         # Used when prompt is short and middle bounds become valid only after
@@ -2319,20 +2321,43 @@ class EchoTokenPrefetchRuntime:
         chunk_pages = int(max(1, min(self.stream_chunk_pages, self.mid_pages)))
         use_a100_full_fast = bool(
             self.a100_fast_prefetch
-            and self._is_a100
-            and has_cuda_pagemax_only_reduced
+            and (self._is_a100 or self._sm == 80)
+            and (has_cuda_pagemax_only_reduced or has_cuda_pagemax_only)
             and (has_delta_full or has_linear_full)
         )
+        if use_a100_full_fast and (not self._a100_fast_reported):
+            self._a100_fast_reported = True
+            print(
+                "[EchoKV] A100 fast prefetch enabled: "
+                f"sm={self._sm}, mid_pages={self.mid_pages}, "
+                f"chunk_pages={chunk_pages} (bypassed)"
+            )
         with torch.cuda.stream(self.recall_stream):
             if use_a100_full_fast:
-                local_best_all = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
-                    q_compact,
-                    local_k,
-                    self.n_q_per_kv,
-                    int(self.sink_len),
-                    self.page_size,
-                    self.mid_pages,
-                )
+                local_best_all = None
+                if has_cuda_pagemax_only_reduced:
+                    local_best_all = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
+                        q_compact,
+                        local_k,
+                        self.n_q_per_kv,
+                        int(self.sink_len),
+                        self.page_size,
+                        self.mid_pages,
+                    )
+                elif has_cuda_pagemax_only:
+                    qh_best_all = kernels.echo_decode_qk_pagemax_chunk_only(
+                        q_compact,
+                        local_k,
+                        self.n_q_per_kv,
+                        int(self.sink_len),
+                        self.page_size,
+                        self.mid_pages,
+                    )
+                    local_best_all = qh_best_all.view(
+                        eff, self.n_kv_heads, self.n_q_per_kv, self.mid_pages
+                    ).float().mean(dim=(1, 2)).round().to(torch.int32)
+                if local_best_all is None:
+                    return False
                 local_best_cpu = local_best_all.to(
                     device=torch.device("cpu"), dtype=torch.int32
                 )

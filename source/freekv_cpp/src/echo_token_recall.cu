@@ -4,6 +4,7 @@
 #include <ATen/Dispatch.h>
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "pytorch_extension_utils.h"
 
@@ -44,6 +45,15 @@ void check_starts_bounds(
           valid_tokens);
     }
   }
+}
+
+bool recall_bounds_check_enabled() {
+  static int enabled = -1;
+  if (enabled < 0) {
+    const char* env = std::getenv("FREEKV_RECALL_CHECK_BOUNDS");
+    enabled = (env != nullptr && std::atoi(env) != 0) ? 1 : 0;
+  }
+  return enabled != 0;
 }
 
 template <typename scalar_t>
@@ -121,7 +131,9 @@ void recall_tokens_linear(
       "token stride mismatch between cpu_kv_linear and gpu_mid_kv");
 
   const int32_t* starts_ptr = starts_cpu.data_ptr<int32_t>();
-  check_starts_bounds(starts_ptr, starts_bsz, n_pages, page_size, valid_tokens, "token_starts");
+  if (recall_bounds_check_enabled()) {
+    check_starts_bounds(starts_ptr, starts_bsz, n_pages, page_size, valid_tokens, "token_starts");
+  }
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -215,8 +227,10 @@ void recall_tokens_delta_linear(
 
   const int32_t* starts_ptr = starts_cpu.data_ptr<int32_t>();
   const int32_t* prev_starts_ptr = prev_starts_cpu.data_ptr<int32_t>();
-  check_starts_bounds(starts_ptr, starts_bsz, n_pages, page_size, valid_tokens, "token_starts");
-  check_starts_bounds(prev_starts_ptr, prev_starts_bsz, n_pages, page_size, valid_tokens, "prev_token_starts");
+  if (recall_bounds_check_enabled()) {
+    check_starts_bounds(starts_ptr, starts_bsz, n_pages, page_size, valid_tokens, "token_starts");
+    check_starts_bounds(prev_starts_ptr, prev_starts_bsz, n_pages, page_size, valid_tokens, "prev_token_starts");
+  }
 
   const bool same_buffer = gpu_prev_mid_kv.data_ptr() == gpu_mid_kv.data_ptr();
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
