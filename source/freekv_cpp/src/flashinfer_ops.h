@@ -271,6 +271,16 @@ void recall_tokens_delta_linear_partial(
     int64_t page_count
 );
 
+void echo_recall_dense_from_starts_cuda(
+    const torch::Tensor &starts_i32,   // [bsz or 1, n_pages], int32/int64, cuda
+    const torch::Tensor &src_hsd,      // [bsz, n_kv_heads, src_tokens, head_dim], cuda
+    torch::Tensor dst_hsd,             // [bsz, n_kv_heads, page_count*page_size, head_dim], cuda
+    int64_t page_size,
+    int64_t page_begin,
+    int64_t page_count,
+    int64_t valid_tokens
+);
+
 void echo_decode_qk_scores_chunk(
     const torch::Tensor &q,      // [bsz, n_q_heads, head_dim], cuda half/bf16
     const torch::Tensor &k,      // [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16

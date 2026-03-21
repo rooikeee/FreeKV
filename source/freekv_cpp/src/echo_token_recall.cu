@@ -964,3 +964,167 @@ void recall_tokens_delta_linear_partial(
     return true;
   });
 }
+
+namespace {
+
+template <typename scalar_t>
+__global__ void echo_recall_dense_from_starts_kernel(
+    const int32_t* __restrict__ starts_ptr,   // [starts_bsz, n_pages]
+    const scalar_t* __restrict__ src_ptr,     // [bsz, n_kv_heads, src_tokens, head_dim]
+    scalar_t* __restrict__ dst_ptr,           // [bsz, n_kv_heads, page_count*page_size, head_dim]
+    int64_t stride_st_b,
+    int64_t stride_st_p,
+    int64_t stride_src_b,
+    int64_t stride_src_h,
+    int64_t stride_src_t,
+    int64_t stride_src_d,
+    int64_t stride_dst_b,
+    int64_t stride_dst_h,
+    int64_t stride_dst_t,
+    int64_t stride_dst_d,
+    int64_t starts_bsz,
+    int64_t n_kv_heads,
+    int64_t page_size,
+    int64_t page_begin,
+    int64_t head_dim) {
+  const int64_t d = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (d >= head_dim) {
+    return;
+  }
+  const int64_t dst_t = static_cast<int64_t>(blockIdx.y);
+  const int64_t page_local = dst_t / page_size;
+  const int64_t tok_local = dst_t - page_local * page_size;
+
+  const int64_t bh = static_cast<int64_t>(blockIdx.z);
+  const int64_t b = bh / n_kv_heads;
+  const int64_t h = bh - b * n_kv_heads;
+  const int64_t sb = (starts_bsz == 1) ? 0 : b;
+  const int64_t p = page_begin + page_local;
+
+  const int32_t start = starts_ptr[sb * stride_st_b + p * stride_st_p];
+  const int64_t src_t = static_cast<int64_t>(start) + tok_local;
+
+  const int64_t src_off =
+      b * stride_src_b + h * stride_src_h + src_t * stride_src_t + d * stride_src_d;
+  const int64_t dst_off =
+      b * stride_dst_b + h * stride_dst_h + dst_t * stride_dst_t + d * stride_dst_d;
+  dst_ptr[dst_off] = src_ptr[src_off];
+}
+
+}  // namespace
+
+void echo_recall_dense_from_starts_cuda(
+    const torch::Tensor &starts_i32,
+    const torch::Tensor &src_hsd,
+    torch::Tensor dst_hsd,
+    int64_t page_size,
+    int64_t page_begin,
+    int64_t page_count,
+    int64_t valid_tokens) {
+  CHECK_CUDA(starts_i32);
+  CHECK_CUDA(src_hsd);
+  CHECK_CUDA(dst_hsd);
+  TORCH_CHECK(starts_i32.dim() == 2, "starts_i32 must be [bsz or 1, n_pages]");
+  TORCH_CHECK(src_hsd.dim() == 4, "src_hsd must be [bsz, n_kv_heads, src_tokens, head_dim]");
+  TORCH_CHECK(dst_hsd.dim() == 4, "dst_hsd must be [bsz, n_kv_heads, dst_tokens, head_dim]");
+  TORCH_CHECK(
+      src_hsd.scalar_type() == dst_hsd.scalar_type(),
+      "src_hsd/dst_hsd dtype mismatch");
+  TORCH_CHECK(page_size > 0, "page_size must be > 0");
+  TORCH_CHECK(page_begin >= 0, "page_begin must be >= 0");
+  TORCH_CHECK(page_count >= 0, "page_count must be >= 0");
+  if (page_count == 0) {
+    return;
+  }
+
+  const int64_t bsz = src_hsd.size(0);
+  const int64_t n_kv_heads = src_hsd.size(1);
+  const int64_t src_tokens = src_hsd.size(2);
+  const int64_t head_dim = src_hsd.size(3);
+  TORCH_CHECK(bsz > 0, "src_hsd batch must be > 0");
+  TORCH_CHECK(n_kv_heads > 0, "src_hsd n_kv_heads must be > 0");
+  TORCH_CHECK(head_dim > 0, "src_hsd head_dim must be > 0");
+  TORCH_CHECK(dst_hsd.size(0) == bsz, "dst_hsd batch mismatch");
+  TORCH_CHECK(dst_hsd.size(1) == n_kv_heads, "dst_hsd n_kv_heads mismatch");
+  TORCH_CHECK(dst_hsd.size(3) == head_dim, "dst_hsd head_dim mismatch");
+  TORCH_CHECK(
+      dst_hsd.size(2) == page_count * page_size,
+      "dst_hsd tokens must equal page_count*page_size");
+  TORCH_CHECK(
+      valid_tokens >= 0 && valid_tokens <= src_tokens,
+      "valid_tokens out of src_hsd range");
+
+  torch::Tensor starts = starts_i32;
+  if (starts.scalar_type() != torch::kInt32) {
+    starts = starts.to(torch::kInt32);
+  }
+  if (!starts.is_contiguous()) {
+    starts = starts.contiguous();
+  }
+  const int64_t starts_bsz = starts.size(0);
+  const int64_t n_pages = starts.size(1);
+  TORCH_CHECK(starts_bsz == 1 || starts_bsz == bsz, "starts batch must be 1 or bsz");
+  TORCH_CHECK(
+      page_begin + page_count <= n_pages,
+      "page_begin + page_count exceeds starts second dim");
+
+  if (recall_bounds_check_enabled()) {
+    auto starts_cpu = starts.to(torch::kCPU).contiguous();
+    const int32_t* starts_ptr_cpu = starts_cpu.data_ptr<int32_t>();
+    for (int64_t sb = 0; sb < starts_bsz; ++sb) {
+      for (int64_t p = page_begin; p < page_begin + page_count; ++p) {
+        const int64_t s = static_cast<int64_t>(starts_ptr_cpu[sb * n_pages + p]);
+        TORCH_CHECK(
+            s >= 0 && s + page_size <= valid_tokens,
+            "starts_i32 out of valid range: start=",
+            s,
+            ", page_size=",
+            page_size,
+            ", valid_tokens=",
+            valid_tokens);
+      }
+    }
+  }
+
+  const int threads = 128;
+  const int64_t dst_tokens = page_count * page_size;
+  const int blocks_d = static_cast<int>((head_dim + threads - 1) / threads);
+  TORCH_CHECK(blocks_d > 0, "invalid head_dim for launch");
+  TORCH_CHECK(dst_tokens <= 2147483647LL, "dst token count is too large");
+  TORCH_CHECK(bsz * n_kv_heads <= 65535, "bsz*n_kv_heads exceeds CUDA grid.z limit");
+  dim3 grid(
+      static_cast<uint32_t>(blocks_d),
+      static_cast<uint32_t>(dst_tokens),
+      static_cast<uint32_t>(bsz * n_kv_heads));
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE(src_hsd.scalar_type(), c_type, [&] {
+    echo_recall_dense_from_starts_kernel<c_type>
+        <<<grid, threads, 0, stream>>>(
+            starts.data_ptr<int32_t>(),
+            reinterpret_cast<const c_type*>(src_hsd.data_ptr()),
+            reinterpret_cast<c_type*>(dst_hsd.data_ptr()),
+            starts.stride(0),
+            starts.stride(1),
+            src_hsd.stride(0),
+            src_hsd.stride(1),
+            src_hsd.stride(2),
+            src_hsd.stride(3),
+            dst_hsd.stride(0),
+            dst_hsd.stride(1),
+            dst_hsd.stride(2),
+            dst_hsd.stride(3),
+            starts_bsz,
+            n_kv_heads,
+            page_size,
+            page_begin,
+            head_dim);
+    return true;
+  });
+
+  cudaError_t err = cudaGetLastError();
+  TORCH_CHECK(
+      err == cudaSuccess,
+      "echo_recall_dense_from_starts_kernel launch failed: ",
+      cudaGetErrorString(err));
+}

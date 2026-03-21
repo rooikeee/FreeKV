@@ -1897,10 +1897,9 @@ class EchoTokenPrefetchRuntime:
         page_begin: int = 0,
         page_count: Optional[int] = None,
     ) -> bool:
-        # A100-oriented path: recall directly from dense GPU KV cache to avoid
-        # CPU pinned-memory H2D memcpy in decode prefetch.
-        if not self.use_triton_recall_a100:
-            return False
+        # A100-oriented GPU dense recall:
+        # - prefer native CUDA kernel from freekv_cpp
+        # - fallback to Triton gather kernel
         if (not self._is_a100) and self._sm != 80:
             return False
         if self.dense_k is None or self.dense_v is None:
@@ -1924,7 +1923,52 @@ class EchoTokenPrefetchRuntime:
         if starts_i32.shape[0] not in (1, int(self.eff_batch)):
             return False
 
-        starts_dev = starts_i32
+        starts_dev_base = starts_i32
+        if starts_dev_base.device.type != "cuda":
+            starts_dev_base = starts_dev_base.to(
+                device=self.device, dtype=torch.int32, non_blocking=True
+            )
+        elif starts_dev_base.dtype != torch.int32:
+            starts_dev_base = starts_dev_base.to(dtype=torch.int32)
+        if not starts_dev_base.is_contiguous():
+            starts_dev_base = starts_dev_base.contiguous()
+
+        tok0 = int(page_begin * self.page_size)
+        tok1 = int((page_begin + page_count) * self.page_size)
+        src_k = self.dense_k[: self.eff_batch, :, : self.cpu_len]
+        src_v = self.dense_v[: self.eff_batch, :, : self.cpu_len]
+        dst_k = out_buf[:, tok0:tok1, 0].permute(0, 2, 1, 3)
+        dst_v = out_buf[:, tok0:tok1, 1].permute(0, 2, 1, 3)
+
+        # Native CUDA path (no Triton dependency).
+        if hasattr(kernels, "echo_recall_dense_from_starts_cuda"):
+            try:
+                kernels.echo_recall_dense_from_starts_cuda(
+                    starts_dev_base,
+                    src_k,
+                    dst_k,
+                    self.page_size,
+                    page_begin,
+                    page_count,
+                    self.cpu_len,
+                )
+                kernels.echo_recall_dense_from_starts_cuda(
+                    starts_dev_base,
+                    src_v,
+                    dst_v,
+                    self.page_size,
+                    page_begin,
+                    page_count,
+                    self.cpu_len,
+                )
+                return True
+            except Exception:
+                pass
+
+        if not self.use_triton_recall_a100:
+            return False
+
+        starts_dev = starts_dev_base
         if starts_dev.device.type != "cuda":
             starts_dev = starts_dev.to(
                 device=self.device, dtype=torch.int32, non_blocking=True
@@ -1941,13 +1985,6 @@ class EchoTokenPrefetchRuntime:
         starts_slice = starts_dev[:, page_begin:p1]
         if not starts_slice.is_contiguous():
             starts_slice = starts_slice.contiguous()
-        tok0 = int(page_begin * self.page_size)
-        tok1 = int(p1 * self.page_size)
-
-        src_k = self.dense_k[: self.eff_batch, :, : self.cpu_len]
-        src_v = self.dense_v[: self.eff_batch, :, : self.cpu_len]
-        dst_k = out_buf[:, tok0:tok1, 0].permute(0, 2, 1, 3)
-        dst_v = out_buf[:, tok0:tok1, 1].permute(0, 2, 1, 3)
 
         ok_k = _triton_recall_dense_linear(
             starts_slice,
@@ -2449,7 +2486,16 @@ class EchoTokenPrefetchRuntime:
         can_triton_recall = bool(
             self.use_triton_recall_a100 and (self._is_a100 or self._sm == 80)
         )
-        if (not has_delta_partial) and (not has_linear_partial) and (not can_triton_recall):
+        can_cuda_dense_recall = bool(
+            hasattr(kernels, "echo_recall_dense_from_starts_cuda")
+            and (self._is_a100 or self._sm == 80)
+        )
+        if (
+            (not has_delta_partial)
+            and (not has_linear_partial)
+            and (not can_triton_recall)
+            and (not can_cuda_dense_recall)
+        ):
             return None
 
         bsz = q.shape[0]
@@ -2485,7 +2531,7 @@ class EchoTokenPrefetchRuntime:
             active_starts_cpu = active_starts_cpu.to(
                 device=torch.device("cpu"), dtype=torch.int32
             ).contiguous()
-        use_gpu_starts = bool(can_triton_recall)
+        use_gpu_starts = bool(can_triton_recall or can_cuda_dense_recall)
         if use_gpu_starts:
             starts_full_gpu = active_starts_cpu.to(
                 device=q_compact.device, dtype=torch.int32, non_blocking=True
@@ -2495,7 +2541,9 @@ class EchoTokenPrefetchRuntime:
             starts_full_gpu = None
             starts_full_cpu = active_starts_cpu.clone()
         local_best_full = torch.empty(
-            (eff, self.mid_pages), dtype=torch.int32, device=torch.device("cpu")
+            (eff, self.mid_pages),
+            dtype=torch.int32,
+            device=(q_compact.device if use_gpu_starts else torch.device("cpu")),
         )
 
         pending_idx = 1 - self.active_idx
@@ -2540,10 +2588,15 @@ class EchoTokenPrefetchRuntime:
             local_best_chunk = qh_best.view(
                 eff, self.n_kv_heads, self.n_q_per_kv, p_count
             ).float().mean(dim=(1, 2)).round().to(torch.int32)
-            local_best_chunk_cpu = local_best_chunk.to(
-                device=torch.device("cpu"), dtype=torch.int32
-            )
-            local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
+            if use_gpu_starts:
+                local_best_full[:, p0 : p0 + p_count].copy_(
+                    local_best_chunk, non_blocking=True
+                )
+            else:
+                local_best_chunk_cpu = local_best_chunk.to(
+                    device=torch.device("cpu"), dtype=torch.int32
+                )
+                local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
 
             if use_gpu_starts:
                 starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
@@ -2625,7 +2678,12 @@ class EchoTokenPrefetchRuntime:
             seq_len,
         )
 
-        anchors = (self.active_starts + local_best_full).to(
+        local_best_full_cpu = (
+            local_best_full.to(device=torch.device("cpu"), dtype=torch.int32)
+            if use_gpu_starts
+            else local_best_full
+        )
+        anchors = (self.active_starts + local_best_full_cpu).to(
             device=torch.device("cpu"), dtype=torch.int32
         ).contiguous()
         self.anchors = anchors
@@ -2711,12 +2769,17 @@ class EchoTokenPrefetchRuntime:
         can_triton_recall = bool(
             self.use_triton_recall_a100 and (self._is_a100 or self._sm == 80)
         )
+        can_cuda_dense_recall = bool(
+            hasattr(kernels, "echo_recall_dense_from_starts_cuda")
+            and (self._is_a100 or self._sm == 80)
+        )
         if (
             (not has_delta_partial)
             and (not has_linear_partial)
             and (not has_delta_full)
             and (not has_linear_full)
             and (not can_triton_recall)
+            and (not can_cuda_dense_recall)
         ):
             return False
 
@@ -2753,7 +2816,7 @@ class EchoTokenPrefetchRuntime:
             active_starts_cpu = active_starts_cpu.to(
                 device=torch.device("cpu"), dtype=torch.int32
             ).contiguous()
-        use_gpu_starts = bool(can_triton_recall)
+        use_gpu_starts = bool(can_triton_recall or can_cuda_dense_recall)
         if use_gpu_starts:
             starts_full_gpu = active_starts_cpu.to(
                 device=q_compact.device, dtype=torch.int32, non_blocking=True
@@ -2778,7 +2841,9 @@ class EchoTokenPrefetchRuntime:
             self.reduce_host_sync
             and self.mid_pages <= int(self.full_fast_pages_threshold)
         )
-        has_full_recall = bool(has_delta_full or has_linear_full or can_triton_recall)
+        has_full_recall = bool(
+            has_delta_full or has_linear_full or can_triton_recall or can_cuda_dense_recall
+        )
         use_full_fast = bool(
             (has_cuda_pagemax_only_reduced or has_cuda_pagemax_only)
             and has_full_recall
@@ -2936,9 +3001,6 @@ class EchoTokenPrefetchRuntime:
                         local_best_chunk = qh_best.view(
                             eff, self.n_kv_heads, self.n_q_per_kv, p_count
                         ).float().mean(dim=(1, 2)).round().to(torch.int32)
-                    local_best_chunk_cpu = local_best_chunk.to(
-                        device=torch.device("cpu"), dtype=torch.int32
-                    )
                     if use_gpu_starts:
                         starts_chunk_gpu = (
                             starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
@@ -2952,6 +3014,9 @@ class EchoTokenPrefetchRuntime:
                             starts_chunk_gpu, non_blocking=True
                         )
                     else:
+                        local_best_chunk_cpu = local_best_chunk.to(
+                            device=torch.device("cpu"), dtype=torch.int32
+                        )
                         starts_chunk_cpu = (
                             starts_full_cpu[:, p0 : p0 + p_count] + local_best_chunk_cpu
                         )
