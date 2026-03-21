@@ -66,10 +66,26 @@ class InferState:
             )
         if n_unlimited_layers is None:
             n_unlimited_layers = 0
+        sel_policy_cfg = str(kwargs.get("sel_policy", "topk"))
+        echo_native_only_cfg = bool(kwargs.get("echo_native_only", True))
+        echo_fullkv_first_layer_cfg = bool(
+            kwargs.get("echo_fullkv_first_layer", False)
+        )
         if not isinstance(page_budgets, (list, tuple)):
             page_budgets = [None] * n_unlimited_layers + [page_budgets] * (
                 n_layers - n_unlimited_layers
             )
+        else:
+            page_budgets = list(page_budgets)
+        # Speed-first EchoKV option:
+        # keep first layer in full-attention mode (no CPU offload / no recall).
+        if (
+            sel_policy_cfg == "echokv_token"
+            and echo_native_only_cfg
+            and echo_fullkv_first_layer_cfg
+            and len(page_budgets) > 0
+        ):
+            page_budgets[0] = None
         full_attn_layers_env = os.getenv("FULLKV_LAYERS")
         if full_attn_layers_env:
             full_attn_layers = [
@@ -235,19 +251,15 @@ class InferState:
         assert self.echo_attn_backend in ("sdpa", "flashinfer", "flash_attn")
         assert self.echo_flash_mode in ("fused_fast", "split_overlap")
         if self.echo_token and self.echo_native_only:
-            if any(b is None for b in self.layer2budget):
-                raise ValueError(
-                    "echokv_token native mode requires all layers to use finite page budgets "
-                    "(no full-attention layers)."
-                )
             if self.echo_attn_backend != "flash_attn":
                 raise ValueError(
                     "echokv_token native mode requires echo_attn_backend=flash_attn"
                 )
-            if self.echo_flash_mode != "split_overlap":
-                raise ValueError(
-                    "echokv_token native mode requires echo_flash_mode=split_overlap"
-                )
+        self._echo_native_full_layers: List[int] = []
+        if self.echo_token and self.echo_native_only:
+            self._echo_native_full_layers = [
+                i for i, b in enumerate(self.layer2budget) if b is None
+            ]
 
         assert recall_impl in ("arkvale", "torch_cpy", "cuda_cpy"), f"Unknown recall_impl: {recall_impl}"
         self.recall_impl = recall_impl
@@ -581,8 +593,16 @@ class InferState:
 
     def _finish_prefill(self, bsz, q_len):
         if self.echo_token and self.echo_native_only:
-            # Native Echo decode does not consume legacy paged-KV decode metadata.
-            # Prefill handler still needs end_forward for wrapper lifecycle.
+            # Native Echo decode does not consume legacy paged-KV decode metadata
+            # for token-recall layers, but full-attention layers still need
+            # decode indptr metadata.
+            if len(self._echo_native_full_layers) > 0:
+                n_kv_pages = utils.all_eq(
+                    self.kv_caches[l].n_real_pages for l in self._echo_native_full_layers
+                )
+                self.kv_decode_indptrs_tab[None] = self.kv_indptrs_tab[None] = torch.arange(
+                    0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
+                )
             self.prefill_handler.end_forward()
             return
         for b, ls in self.budget2layers.items():
@@ -605,6 +625,9 @@ class InferState:
         # each layer prefill forward. Release immediately to keep pool pressure low.
         if not (self.echo_token and self.echo_native_only):
             return
+        if self.layer2budget[layer_idx] is None:
+            # Full-attention layers stay resident on GPU for decode.
+            return
         kvc = self.kv_caches[layer_idx]
         if kvc is None or kvc.n_real_pages <= 0:
             return
@@ -612,15 +635,55 @@ class InferState:
 
     def _prepare_decode(self, bsz):
         if self.echo_token and self.echo_native_only:
-            seq_for_rope = None
-            for rt in self.echo_runtimes:
-                if rt is not None:
-                    seq_for_rope = int(rt.cpu_len)
-                    break
-            if seq_for_rope is None:
-                seq_for_rope = int(self.kv_caches[0].seq_len)
+            full_layers = self._echo_native_full_layers
+            if len(full_layers) == 0:
+                seq_for_rope = None
+                for rt in self.echo_runtimes:
+                    if rt is not None:
+                        seq_for_rope = int(rt.cpu_len)
+                        break
+                if seq_for_rope is None:
+                    seq_for_rope = int(self.kv_caches[0].seq_len)
+                self.rope_indptr = torch.arange(0, bsz + 1, 1, **self._i32)
+                self.rope_offsets = torch.full((bsz,), seq_for_rope, **self._i32)
+                return
+
+            # Mixed native mode:
+            # - Echo layers (budget!=None): no legacy decode-page allocation
+            # - Full-attn layers (budget==None): keep legacy full-KV decode path
+            if self.kv_last_page_len + 1 >= self.page_size:
+                self.default_stream.wait_stream(self.decode_backup_stream)
+            n_new_kv_pages = utils.all_eq(
+                self.kv_caches[l].decode_alloc_1_token(self.alloc_page) for l in full_layers
+            )
+            self.kv_last_page_len = utils.all_eq(
+                self.kv_caches[l].last_page_len for l in full_layers
+            )
+            self.kv_last_page_lens = torch.tensor(
+                [self.kv_last_page_len] * bsz, **self._i32
+            )
+            if n_new_kv_pages > 0:
+                assert n_new_kv_pages == 1
+                n_kv_pages = utils.all_eq(self.kv_caches[l].n_real_pages for l in full_layers)
+                self.kv_decode_indptrs_tab[None] = self.kv_indptrs_tab[None] = torch.arange(
+                    0, bsz * n_kv_pages + 1, n_kv_pages, **self._i32
+                )
+
+            seq_for_rope = int(self.kv_caches[full_layers[0]].seq_len)
             self.rope_indptr = torch.arange(0, bsz + 1, 1, **self._i32)
             self.rope_offsets = torch.full((bsz,), seq_for_rope, **self._i32)
+
+            h_full = self.decode_handler_tab.get(None, None)
+            if h_full is not None:
+                h_full.begin_forward(
+                    self.kv_decode_indptrs_tab[None],
+                    self.kv_last_page_lens,
+                    self.n_qo_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.page_size,
+                    data_type=self.dtype,
+                )
             return
 
         if self.kv_last_page_len + 1 >= self.page_size:
@@ -708,6 +771,11 @@ class InferState:
 
     def _finish_decode(self, bsz):
         if self.echo_token and self.echo_native_only:
+            # Mixed native mode: full-attn layers still use legacy decode handler.
+            if len(self._echo_native_full_layers) > 0:
+                h_full = self.decode_handler_tab.get(None, None)
+                if h_full is not None:
+                    h_full.end_forward()
             return
         for handler in self.decode_handler_tab.values():
             handler.end_forward()

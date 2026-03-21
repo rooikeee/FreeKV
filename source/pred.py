@@ -134,6 +134,8 @@ def parse_args(args=None):
                         help="Disable fast stream mode (selection-only + flash-attn output) and use score-cache split path")
     parser.add_argument("--echo_disable_native_only", action="store_true",
                         help="Allow legacy fallback paths for echokv_token (slower; debug only)")
+    parser.add_argument("--echo_disable_fullkv_first_layer", action="store_true",
+                        help="Disable speed mode that keeps layer-0 KV fully on GPU (no CPU offload/recall)")
     parser.add_argument("--echo_attn_backend", type=str, default="flash_attn",
                         choices=["sdpa", "flashinfer", "flash_attn"],
                         help="Attention backend for EchoKV-token decode")
@@ -218,16 +220,27 @@ def load_model_and_tokenizer(path):
            f"triton_recall_a100={use_triton_recall_a100}, "
            f"a100_sdpa_attn={use_a100_sdpa_attn}, "
            f"cuda_chunk_attn_a100={use_cuda_chunk_attn_a100}, "
-           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
+           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}, "
+           f"fullkv_first_layer={(not args.echo_disable_fullkv_first_layer)}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
+        page_budgets_cfg = page_budgets
+        page_topks_cfg = page_budgets - 1
+        if (
+            args.sel_policy == "echokv_token"
+            and (not args.echo_disable_native_only)
+            and (not args.echo_disable_fullkv_first_layer)
+        ):
+            n_layers = int(model.config.num_hidden_layers)
+            page_budgets_cfg = [None] + [page_budgets] * max(0, n_layers - 1)
+            page_topks_cfg = [None] + [page_budgets - 1] * max(0, n_layers - 1)
         infer_state = adapter.enable_offload(
             model, 
             dtype=dtype, 
             device=dev, 
             page_size=page_size,
-            page_budgets=page_budgets,
-            page_topks=page_budgets-1,
+            page_budgets=page_budgets_cfg,
+            page_topks=page_topks_cfg,
             n_sink_pages=n_sink_pages,
             n_win_pages=n_win_pages,
             n_max_bytes=6 * (1 << 30),
@@ -251,6 +264,7 @@ def load_model_and_tokenizer(path):
             echo_lazy_cpu_copy=(not args.echo_disable_lazy_cpu_copy),
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
             echo_native_only=(not args.echo_disable_native_only),
+            echo_fullkv_first_layer=(not args.echo_disable_fullkv_first_layer),
             echo_shared_batch=args.echo_shared_batch,
             echo_shared_decode_full_model=(
                 not args.echo_disable_shared_decode_full_model
@@ -404,11 +418,11 @@ if __name__ == "__main__":
                     f"{YELLOW}[EchoKV] forcing --echo_attn_backend=flash_attn in native mode.{RESET}"
                 )
                 args.echo_attn_backend = "flash_attn"
-            if args.echo_flash_mode != "split_overlap":
+            if args.echo_flash_mode != "fused_fast":
                 print(
-                    f"{YELLOW}[EchoKV] forcing --echo_flash_mode=split_overlap in native mode.{RESET}"
+                    f"{YELLOW}[EchoKV] forcing --echo_flash_mode=fused_fast in native mode.{RESET}"
                 )
-                args.echo_flash_mode = "split_overlap"
+                args.echo_flash_mode = "fused_fast"
         # EchoKV-token path uses token-wise runtime recall, not FreeKV page recall.
         if args.spec_ret:
             print(
