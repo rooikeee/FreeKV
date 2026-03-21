@@ -1199,8 +1199,9 @@ class EchoTokenPrefetchRuntime:
             device=torch.device("cpu"),
             pin_memory=True,
         )
-        if self.cpu_len > 0:
-            new_buf[:, : self.cpu_len].copy_(self.cpu_kv[:, : self.cpu_len], non_blocking=False)
+        copy_len = int(min(self.cpu_synced_len, self.cpu_kv.size(1)))
+        if copy_len > 0:
+            new_buf[:, :copy_len].copy_(self.cpu_kv[:, :copy_len], non_blocking=False)
         self.cpu_kv = new_buf
         self.cpu_capacity = new_cap
 
