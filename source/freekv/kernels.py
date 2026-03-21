@@ -508,6 +508,29 @@ def echo_recall_dense_from_starts_cuda(
         valid_tokens,
     )
 
+def echo_recall_dense_kv_from_starts_cuda(
+    starts_i32,      # [bsz or 1, n_pages], int32/int64, cuda
+    src_k_hsd,       # [bsz, n_kv_heads, src_tokens, head_dim], cuda
+    src_v_hsd,       # [bsz, n_kv_heads, src_tokens, head_dim], cuda
+    dst_k_hsd,       # [bsz, n_kv_heads, page_count*page_size, head_dim], cuda
+    dst_v_hsd,       # [bsz, n_kv_heads, page_count*page_size, head_dim], cuda
+    page_size: int,
+    page_begin: int,
+    page_count: int,
+    valid_tokens: int,
+):
+    _cpp.echo_recall_dense_kv_from_starts_cuda(
+        starts_i32,
+        src_k_hsd,
+        src_v_hsd,
+        dst_k_hsd,
+        dst_v_hsd,
+        page_size,
+        page_begin,
+        page_count,
+        valid_tokens,
+    )
+
 def echo_decode_qk_scores_chunk(
     q,                # [bsz, n_q_heads, head_dim], cuda half/bf16
     k,                # [bsz, n_kv_heads, seq_len, head_dim], cuda half/bf16

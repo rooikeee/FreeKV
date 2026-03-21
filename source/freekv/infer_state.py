@@ -844,7 +844,11 @@ class InferState:
                 "Echo native decode requires flash_attn backend only"
             )
         cur_seq = rt.cpu_len
-        if rt.middle_bounds(cur_seq) is not None and rt.cpu_synced_len < cur_seq:
+        if (
+            rt.middle_bounds(cur_seq) is not None
+            and rt.cpu_synced_len < cur_seq
+            and (not rt.can_use_gpu_dense_recall())
+        ):
             # Lazy CPU copy mode: backfill unsynced tail only when sparse recall
             # path becomes active.
             pack_sync_t0 = self._perf_start("pack")
