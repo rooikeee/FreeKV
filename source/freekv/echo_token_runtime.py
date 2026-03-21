@@ -1177,12 +1177,14 @@ class EchoTokenPrefetchRuntime:
         need_alloc = (
             self.device != device
             or self.dtype != dtype
-            or self.batch_size != bsz
             or self.eff_batch != eff_bsz
             or self.cpu_kv is None
             or self.gpu_mid[0] is None
         )
         if not need_alloc:
+            # shared-batch decode fast path may switch bsz (e.g., prefill bsz>1,
+            # decode bsz=1) while using the same effective runtime buffers.
+            self.batch_size = bsz
             return
 
         self.device = device
@@ -1519,6 +1521,14 @@ class EchoTokenPrefetchRuntime:
         v_tok_h = v_tok_eff.transpose(1, 2)
 
         if self.sink_tokens > 0:
+            if self.sink_k is None or self.sink_v is None:
+                self.sink_k = torch.empty(
+                    (self.eff_batch, self.n_kv_heads, self.sink_tokens, self.head_dim),
+                    dtype=k_tok_h.dtype,
+                    device=k_tok_h.device,
+                )
+                self.sink_v = torch.empty_like(self.sink_k)
+                self.sink_len = 0
             if self.sink_len < self.sink_tokens:
                 self.sink_k[:, :, self.sink_len : self.sink_len + 1].copy_(k_tok_h, non_blocking=True)
                 self.sink_v[:, :, self.sink_len : self.sink_len + 1].copy_(v_tok_h, non_blocking=True)
@@ -1527,6 +1537,15 @@ class EchoTokenPrefetchRuntime:
                 self._sync_sink_to_page_buffers()
 
         if self.win_tokens > 0:
+            if self.win_k is None or self.win_v is None:
+                self.win_k = torch.empty(
+                    (self.eff_batch, self.n_kv_heads, self.win_tokens, self.head_dim),
+                    dtype=k_tok_h.dtype,
+                    device=k_tok_h.device,
+                )
+                self.win_v = torch.empty_like(self.win_k)
+                self.win_len = 0
+                self.win_ptr = 0
             if self.win_len < self.win_tokens:
                 self.win_k[:, :, self.win_len : self.win_len + 1].copy_(k_tok_h, non_blocking=True)
                 self.win_v[:, :, self.win_len : self.win_len + 1].copy_(v_tok_h, non_blocking=True)
