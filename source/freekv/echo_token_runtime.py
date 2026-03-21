@@ -2487,6 +2487,20 @@ class EchoTokenPrefetchRuntime:
             starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
 
             with torch.cuda.stream(self.recall_stream):
+                used_triton_partial = False
+                try:
+                    used_triton_partial = self._triton_recall_from_dense(
+                        starts_full,
+                        out_buf,
+                        p0,
+                        p_count,
+                    )
+                except Exception:
+                    used_triton_partial = False
+
+                if used_triton_partial:
+                    continue
+
                 if has_delta_partial and self.active_starts is not None:
                     kernels.recall_tokens_delta_linear_partial(
                         starts_dev,
@@ -2805,6 +2819,20 @@ class EchoTokenPrefetchRuntime:
                         max=max_start,
                     ).to(dtype=torch.int32)
                     starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
+
+                    used_triton_partial = False
+                    try:
+                        used_triton_partial = self._triton_recall_from_dense(
+                            starts_full,
+                            out_buf,
+                            p0,
+                            p_count,
+                        )
+                    except Exception:
+                        used_triton_partial = False
+
+                    if used_triton_partial:
+                        continue
 
                     if has_delta_partial and self.active_starts is not None:
                         kernels.recall_tokens_delta_linear_partial(
