@@ -2370,6 +2370,14 @@ class EchoTokenPrefetchRuntime:
                     ).to(dtype=torch.int32),
                     non_blocking=False,
                 )
+                # A100 path: sort starts to improve contiguous run detection in
+                # recall memcpy scheduling (attention is permutation-invariant).
+                starts_full.copy_(
+                    torch.sort(starts_full, dim=-1).values.to(
+                        device=torch.device("cpu"), dtype=torch.int32
+                    ),
+                    non_blocking=False,
+                )
                 if has_delta_full and self.active_starts is not None:
                     kernels.recall_tokens_delta_linear(
                         starts_dev,
@@ -2475,9 +2483,15 @@ class EchoTokenPrefetchRuntime:
                     else:
                         self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
 
-            anchors = (self.active_starts + local_best_full).to(
-                device=torch.device("cpu"), dtype=torch.int32
-            ).contiguous()
+            if use_a100_full_fast:
+                # Keep anchors aligned with the sorted pending starts.
+                anchors = (starts_full + int(self.slide_half_window)).to(
+                    device=torch.device("cpu"), dtype=torch.int32
+                ).contiguous()
+            else:
+                anchors = (self.active_starts + local_best_full).to(
+                    device=torch.device("cpu"), dtype=torch.int32
+                ).contiguous()
             self.anchors = anchors
             self._set_prefetch_hint(starts_full, int(target_seq_len))
 

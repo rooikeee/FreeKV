@@ -901,43 +901,83 @@ class InferState:
 
                 stream_prefetch_ready = False
                 if rt.stream_prefetch_only:
-                    # Launch next-step chunk prefetch first so it can overlap with
-                    # current-step flash attention on another stream.
-                    rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
-                    stream_prefetch_ready = rt.select_and_prefetch_stream_only(
-                        q,
-                        local_k,
-                        target_seq_len=cur_seq + 1,
-                        # Overlap mode must avoid writing active buffer while
-                        # current-step attention is reading it.
-                        allow_inplace_delta=False,
+                    a100_serial_inplace = bool(
+                        rt.a100_fast_prefetch
+                        and (getattr(rt, "_is_a100", False) or getattr(rt, "_sm", 0) == 80)
                     )
-                    self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
-                    if (not stream_prefetch_ready):
-                        if self.echo_require_triton_flash:
-                            raise RuntimeError(
-                                "echo stream_prefetch_only path is unavailable, "
-                                "which means chunk-level CUDA page-max + partial recall "
-                                "did not run."
-                            )
-                    attn_t0 = self._perf_start("attn")
-                    out = rt.attend_flash_attn(
-                        q,
-                        local_k,
-                        local_v,
-                        strict=False,
-                    )
-                    self._perf_stop("attn", attn_t0)
-                    if not stream_prefetch_ready:
-                        next_starts = rt.build_starts(cur_seq + 1)
-                        if next_starts is not None:
-                            rec_t2 = self._perf_start("recall", stream=rt.recall_stream)
-                            rt.launch_prefetch(
-                                next_starts,
-                                target_seq_len=cur_seq + 1,
-                                allow_inplace_delta=True,
-                            )
-                            self._perf_stop("recall", rec_t2, stream=rt.recall_stream)
+                    if a100_serial_inplace:
+                        # A100 path: prioritize lower copy traffic over overlap.
+                        # Run attn first, then patch active middle buffer in-place.
+                        attn_t0 = self._perf_start("attn")
+                        out = rt.attend_flash_attn(
+                            q,
+                            local_k,
+                            local_v,
+                            strict=False,
+                        )
+                        self._perf_stop("attn", attn_t0)
+                        rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                        stream_prefetch_ready = rt.select_and_prefetch_stream_only(
+                            q,
+                            local_k,
+                            target_seq_len=cur_seq + 1,
+                            allow_inplace_delta=True,
+                        )
+                        self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+                        if (not stream_prefetch_ready):
+                            if self.echo_require_triton_flash:
+                                raise RuntimeError(
+                                    "echo stream_prefetch_only path is unavailable, "
+                                    "which means chunk-level CUDA page-max + partial recall "
+                                    "did not run."
+                                )
+                            next_starts = rt.build_starts(cur_seq + 1)
+                            if next_starts is not None:
+                                rec_t2 = self._perf_start("recall", stream=rt.recall_stream)
+                                rt.launch_prefetch(
+                                    next_starts,
+                                    target_seq_len=cur_seq + 1,
+                                    allow_inplace_delta=True,
+                                )
+                                self._perf_stop("recall", rec_t2, stream=rt.recall_stream)
+                    else:
+                        # Launch next-step chunk prefetch first so it can overlap with
+                        # current-step flash attention on another stream.
+                        rec_t1 = self._perf_start("recall", stream=rt.recall_stream)
+                        stream_prefetch_ready = rt.select_and_prefetch_stream_only(
+                            q,
+                            local_k,
+                            target_seq_len=cur_seq + 1,
+                            # Overlap mode must avoid writing active buffer while
+                            # current-step attention is reading it.
+                            allow_inplace_delta=False,
+                        )
+                        self._perf_stop("recall", rec_t1, stream=rt.recall_stream)
+                        if (not stream_prefetch_ready):
+                            if self.echo_require_triton_flash:
+                                raise RuntimeError(
+                                    "echo stream_prefetch_only path is unavailable, "
+                                    "which means chunk-level CUDA page-max + partial recall "
+                                    "did not run."
+                                )
+                        attn_t0 = self._perf_start("attn")
+                        out = rt.attend_flash_attn(
+                            q,
+                            local_k,
+                            local_v,
+                            strict=False,
+                        )
+                        self._perf_stop("attn", attn_t0)
+                        if not stream_prefetch_ready:
+                            next_starts = rt.build_starts(cur_seq + 1)
+                            if next_starts is not None:
+                                rec_t2 = self._perf_start("recall", stream=rt.recall_stream)
+                                rt.launch_prefetch(
+                                    next_starts,
+                                    target_seq_len=cur_seq + 1,
+                                    allow_inplace_delta=True,
+                                )
+                                self._perf_stop("recall", rec_t2, stream=rt.recall_stream)
                 else:
                     attn_t0 = self._perf_start("attn")
                     score_cache = None
