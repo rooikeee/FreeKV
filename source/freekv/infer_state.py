@@ -234,6 +234,9 @@ class InferState:
         self.echo_stream_prefetch_only = bool(
             kwargs.get("echo_stream_prefetch_only", True)
         )
+        self.echo_prefetch_pack_buffers = bool(
+            kwargs.get("echo_prefetch_pack_buffers", True)
+        )
         self.echo_a100_fast_prefetch = bool(
             kwargs.get("echo_a100_fast_prefetch", True)
         )
@@ -369,6 +372,7 @@ class InferState:
                     enable_page_kv=enable_page_kv,
                     stream_chunk_pages=self.echo_stream_chunk_pages,
                     stream_prefetch_only=self.echo_stream_prefetch_only,
+                    prefetch_pack_buffers=self.echo_prefetch_pack_buffers,
                     a100_fast_prefetch=self.echo_a100_fast_prefetch,
                     lazy_cpu_copy=self.echo_lazy_cpu_copy,
                     reduce_host_sync=self.echo_reduce_host_sync,

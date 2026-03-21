@@ -318,8 +318,8 @@ __global__ void echo_pv_from_scores_kernel(
   }
 }
 
-template <typename scalar_t>
-void launch_qk_scores_chunk(
+template <typename scalar_t, int THREADS>
+void launch_qk_scores_chunk_impl(
     const torch::Tensor& q,
     const torch::Tensor& k,
     torch::Tensor scores,
@@ -329,7 +329,6 @@ void launch_qk_scores_chunk(
   if (token_count == 0) {
     return;
   }
-  constexpr int THREADS = 128;
   const int64_t bsz = q.size(0);
   const int64_t n_q_heads = q.size(1);
   const int64_t head_dim = q.size(2);
@@ -360,6 +359,29 @@ void launch_qk_scores_chunk(
           scale);
   cudaError_t err = cudaGetLastError();
   TORCH_CHECK(err == cudaSuccess, "echo_qk_scores_chunk_kernel launch failed: ", cudaGetErrorString(err));
+}
+
+template <typename scalar_t>
+void launch_qk_scores_chunk(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    torch::Tensor scores,
+    int64_t n_q_per_kv,
+    int64_t token_begin,
+    int64_t token_count) {
+  const int64_t head_dim = q.size(2);
+  if (head_dim <= 64) {
+    launch_qk_scores_chunk_impl<scalar_t, 64>(
+        q, k, scores, n_q_per_kv, token_begin, token_count);
+    return;
+  }
+  if (head_dim <= 128) {
+    launch_qk_scores_chunk_impl<scalar_t, 128>(
+        q, k, scores, n_q_per_kv, token_begin, token_count);
+    return;
+  }
+  launch_qk_scores_chunk_impl<scalar_t, 256>(
+      q, k, scores, n_q_per_kv, token_begin, token_count);
 }
 
 }  // namespace
@@ -413,23 +435,59 @@ torch::Tensor echo_decode_qk_scores_pagemax_chunk(
       {q.size(0), q.size(1), page_count},
       torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
 
-  constexpr int THREADS = 128;
   const int64_t total = q.size(0) * q.size(1) * page_count;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  echo_page_argmax_from_scores_kernel<THREADS>
-      <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
-          scores.data_ptr<float>(),
-          out_best.data_ptr<int32_t>(),
-          scores.stride(0),
-          scores.stride(1),
-          scores.stride(2),
-          out_best.stride(0),
-          out_best.stride(1),
-          out_best.stride(2),
-          q.size(1),
-          token_begin,
-          page_size,
-          page_count);
+  const int threads = (page_size <= 32) ? 32 : ((page_size <= 64) ? 64 : 128);
+  switch (threads) {
+    case 32:
+      echo_page_argmax_from_scores_kernel<32>
+          <<<static_cast<uint32_t>(total), 32, 0, stream>>>(
+              scores.data_ptr<float>(),
+              out_best.data_ptr<int32_t>(),
+              scores.stride(0),
+              scores.stride(1),
+              scores.stride(2),
+              out_best.stride(0),
+              out_best.stride(1),
+              out_best.stride(2),
+              q.size(1),
+              token_begin,
+              page_size,
+              page_count);
+      break;
+    case 64:
+      echo_page_argmax_from_scores_kernel<64>
+          <<<static_cast<uint32_t>(total), 64, 0, stream>>>(
+              scores.data_ptr<float>(),
+              out_best.data_ptr<int32_t>(),
+              scores.stride(0),
+              scores.stride(1),
+              scores.stride(2),
+              out_best.stride(0),
+              out_best.stride(1),
+              out_best.stride(2),
+              q.size(1),
+              token_begin,
+              page_size,
+              page_count);
+      break;
+    default:
+      echo_page_argmax_from_scores_kernel<128>
+          <<<static_cast<uint32_t>(total), 128, 0, stream>>>(
+              scores.data_ptr<float>(),
+              out_best.data_ptr<int32_t>(),
+              scores.stride(0),
+              scores.stride(1),
+              scores.stride(2),
+              out_best.stride(0),
+              out_best.stride(1),
+              out_best.stride(2),
+              q.size(1),
+              token_begin,
+              page_size,
+              page_count);
+      break;
+  }
   cudaError_t err = cudaGetLastError();
   TORCH_CHECK(
       err == cudaSuccess,
@@ -453,20 +511,46 @@ torch::Tensor echo_decode_qk_scores_pagemax_chunk_reduced(
       {q.size(0), page_count},
       torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
 
-  constexpr int THREADS = 128;
   const int64_t total = q.size(0) * page_count;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  echo_reduce_qh_best_mean_kernel<THREADS>
-      <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
-          out_qh.data_ptr<int32_t>(),
-          out_best.data_ptr<int32_t>(),
-          out_qh.stride(0),
-          out_qh.stride(1),
-          out_qh.stride(2),
-          out_best.stride(0),
-          out_best.stride(1),
-          q.size(1),
-          page_count);
+  const int64_t n_q_heads = q.size(1);
+  if (n_q_heads <= 32) {
+    echo_reduce_qh_best_mean_kernel<32>
+        <<<static_cast<uint32_t>(total), 32, 0, stream>>>(
+            out_qh.data_ptr<int32_t>(),
+            out_best.data_ptr<int32_t>(),
+            out_qh.stride(0),
+            out_qh.stride(1),
+            out_qh.stride(2),
+            out_best.stride(0),
+            out_best.stride(1),
+            n_q_heads,
+            page_count);
+  } else if (n_q_heads <= 64) {
+    echo_reduce_qh_best_mean_kernel<64>
+        <<<static_cast<uint32_t>(total), 64, 0, stream>>>(
+            out_qh.data_ptr<int32_t>(),
+            out_best.data_ptr<int32_t>(),
+            out_qh.stride(0),
+            out_qh.stride(1),
+            out_qh.stride(2),
+            out_best.stride(0),
+            out_best.stride(1),
+            n_q_heads,
+            page_count);
+  } else {
+    echo_reduce_qh_best_mean_kernel<128>
+        <<<static_cast<uint32_t>(total), 128, 0, stream>>>(
+            out_qh.data_ptr<int32_t>(),
+            out_best.data_ptr<int32_t>(),
+            out_qh.stride(0),
+            out_qh.stride(1),
+            out_qh.stride(2),
+            out_best.stride(0),
+            out_best.stride(1),
+            n_q_heads,
+            page_count);
+  }
   cudaError_t err = cudaGetLastError();
   TORCH_CHECK(
       err == cudaSuccess,
@@ -501,32 +585,82 @@ torch::Tensor echo_decode_qk_pagemax_chunk_only(
   auto out_best = torch::empty(
       {q.size(0), q.size(1), page_count},
       torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
-  constexpr int THREADS = 128;
   const int64_t total = q.size(0) * q.size(1) * page_count;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int threads = (page_size <= 32) ? 32 : ((page_size <= 64) ? 64 : 128);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(q.scalar_type(), c_type, [&] {
-    echo_qk_pagemax_chunk_only_kernel<c_type, THREADS>
-        <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
-            reinterpret_cast<const c_type*>(q.data_ptr()),
-            reinterpret_cast<const c_type*>(k.data_ptr()),
-            out_best.data_ptr<int32_t>(),
-            q.stride(0),
-            q.stride(1),
-            q.stride(2),
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            k.stride(3),
-            out_best.stride(0),
-            out_best.stride(1),
-            out_best.stride(2),
-            q.size(1),
-            n_q_per_kv,
-            q.size(2),
-            token_begin,
-            page_size,
-            page_count);
+    switch (threads) {
+      case 32:
+        echo_qk_pagemax_chunk_only_kernel<c_type, 32>
+            <<<static_cast<uint32_t>(total), 32, 0, stream>>>(
+                reinterpret_cast<const c_type*>(q.data_ptr()),
+                reinterpret_cast<const c_type*>(k.data_ptr()),
+                out_best.data_ptr<int32_t>(),
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                out_best.stride(0),
+                out_best.stride(1),
+                out_best.stride(2),
+                q.size(1),
+                n_q_per_kv,
+                q.size(2),
+                token_begin,
+                page_size,
+                page_count);
+        break;
+      case 64:
+        echo_qk_pagemax_chunk_only_kernel<c_type, 64>
+            <<<static_cast<uint32_t>(total), 64, 0, stream>>>(
+                reinterpret_cast<const c_type*>(q.data_ptr()),
+                reinterpret_cast<const c_type*>(k.data_ptr()),
+                out_best.data_ptr<int32_t>(),
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                out_best.stride(0),
+                out_best.stride(1),
+                out_best.stride(2),
+                q.size(1),
+                n_q_per_kv,
+                q.size(2),
+                token_begin,
+                page_size,
+                page_count);
+        break;
+      default:
+        echo_qk_pagemax_chunk_only_kernel<c_type, 128>
+            <<<static_cast<uint32_t>(total), 128, 0, stream>>>(
+                reinterpret_cast<const c_type*>(q.data_ptr()),
+                reinterpret_cast<const c_type*>(k.data_ptr()),
+                out_best.data_ptr<int32_t>(),
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                k.stride(3),
+                out_best.stride(0),
+                out_best.stride(1),
+                out_best.stride(2),
+                q.size(1),
+                n_q_per_kv,
+                q.size(2),
+                token_begin,
+                page_size,
+                page_count);
+        break;
+    }
     return true;
   });
   cudaError_t err = cudaGetLastError();
@@ -550,20 +684,46 @@ torch::Tensor echo_decode_qk_pagemax_chunk_only_reduced(
       {q.size(0), page_count},
       torch::TensorOptions().dtype(torch::kInt32).device(q.device()));
 
-  constexpr int THREADS = 128;
   const int64_t total = q.size(0) * page_count;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  echo_reduce_qh_best_mean_kernel<THREADS>
-      <<<static_cast<uint32_t>(total), THREADS, 0, stream>>>(
-          out_qh.data_ptr<int32_t>(),
-          out_best.data_ptr<int32_t>(),
-          out_qh.stride(0),
-          out_qh.stride(1),
-          out_qh.stride(2),
-          out_best.stride(0),
-          out_best.stride(1),
-          q.size(1),
-          page_count);
+  const int64_t n_q_heads = q.size(1);
+  if (n_q_heads <= 32) {
+    echo_reduce_qh_best_mean_kernel<32>
+        <<<static_cast<uint32_t>(total), 32, 0, stream>>>(
+            out_qh.data_ptr<int32_t>(),
+            out_best.data_ptr<int32_t>(),
+            out_qh.stride(0),
+            out_qh.stride(1),
+            out_qh.stride(2),
+            out_best.stride(0),
+            out_best.stride(1),
+            n_q_heads,
+            page_count);
+  } else if (n_q_heads <= 64) {
+    echo_reduce_qh_best_mean_kernel<64>
+        <<<static_cast<uint32_t>(total), 64, 0, stream>>>(
+            out_qh.data_ptr<int32_t>(),
+            out_best.data_ptr<int32_t>(),
+            out_qh.stride(0),
+            out_qh.stride(1),
+            out_qh.stride(2),
+            out_best.stride(0),
+            out_best.stride(1),
+            n_q_heads,
+            page_count);
+  } else {
+    echo_reduce_qh_best_mean_kernel<128>
+        <<<static_cast<uint32_t>(total), 128, 0, stream>>>(
+            out_qh.data_ptr<int32_t>(),
+            out_best.data_ptr<int32_t>(),
+            out_qh.stride(0),
+            out_qh.stride(1),
+            out_qh.stride(2),
+            out_best.stride(0),
+            out_best.stride(1),
+            n_q_heads,
+            page_count);
+  }
   cudaError_t err = cudaGetLastError();
   TORCH_CHECK(
       err == cudaSuccess,

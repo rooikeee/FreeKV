@@ -132,6 +132,8 @@ def parse_args(args=None):
                         help="Disable lazy CPU KV copy before sparse-recall activation")
     parser.add_argument("--echo_disable_stream_prefetch_only", action="store_true",
                         help="Disable fast stream mode (selection-only + flash-attn output) and use score-cache split path")
+    parser.add_argument("--echo_disable_prefetch_pack_buffers", action="store_true",
+                        help="Disable prefetch-time packing of middle KV into local buffers")
     parser.add_argument("--echo_disable_native_only", action="store_true",
                         help="Allow legacy fallback paths for echokv_token (slower; debug only)")
     parser.add_argument("--echo_disable_fullkv_first_layer", action="store_true",
@@ -213,10 +215,11 @@ def load_model_and_tokenizer(path):
           f"reduce_host_sync={(not args.echo_disable_reduce_host_sync)}, "
           f"full_fast_pages_threshold={args.echo_full_fast_pages_threshold}, "
           f"lazy_cpu_copy={(not args.echo_disable_lazy_cpu_copy)}, "
-          f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
-          f"native_only={(not args.echo_disable_native_only)}, "
-           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
-           f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
+           f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
+           f"prefetch_pack_buffers={(not args.echo_disable_prefetch_pack_buffers)}, "
+           f"native_only={(not args.echo_disable_native_only)}, "
+            f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
+            f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
            f"triton_recall_a100={use_triton_recall_a100}, "
            f"a100_sdpa_attn={use_a100_sdpa_attn}, "
            f"cuda_chunk_attn_a100={use_cuda_chunk_attn_a100}, "
@@ -263,6 +266,7 @@ def load_model_and_tokenizer(path):
             echo_full_fast_pages_threshold=args.echo_full_fast_pages_threshold,
             echo_lazy_cpu_copy=(not args.echo_disable_lazy_cpu_copy),
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
+            echo_prefetch_pack_buffers=(not args.echo_disable_prefetch_pack_buffers),
             echo_native_only=(not args.echo_disable_native_only),
             echo_fullkv_first_layer=(not args.echo_disable_fullkv_first_layer),
             echo_shared_batch=args.echo_shared_batch,
@@ -418,11 +422,11 @@ if __name__ == "__main__":
                     f"{YELLOW}[EchoKV] forcing --echo_attn_backend=flash_attn in native mode.{RESET}"
                 )
                 args.echo_attn_backend = "flash_attn"
-            if args.echo_flash_mode != "fused_fast":
+            if args.echo_flash_mode != "split_overlap":
                 print(
-                    f"{YELLOW}[EchoKV] forcing --echo_flash_mode=fused_fast in native mode.{RESET}"
+                    f"{YELLOW}[EchoKV] forcing --echo_flash_mode=split_overlap in native mode.{RESET}"
                 )
-                args.echo_flash_mode = "fused_fast"
+                args.echo_flash_mode = "split_overlap"
         # EchoKV-token path uses token-wise runtime recall, not FreeKV page recall.
         if args.spec_ret:
             print(

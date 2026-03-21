@@ -1132,7 +1132,7 @@ void echo_recall_dense_from_starts_cuda(
     }
   }
 
-  const int threads = 128;
+  const int threads = (head_dim <= 64) ? 64 : ((head_dim <= 128) ? 128 : 256);
   const int64_t dst_tokens = page_count * page_size;
   const int blocks_d = static_cast<int>((head_dim + threads - 1) / threads);
   TORCH_CHECK(blocks_d > 0, "invalid head_dim for launch");
@@ -1145,26 +1145,70 @@ void echo_recall_dense_from_starts_cuda(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(src_hsd.scalar_type(), c_type, [&] {
-    echo_recall_dense_from_starts_kernel<c_type>
-        <<<grid, threads, 0, stream>>>(
-            starts.data_ptr<int32_t>(),
-            reinterpret_cast<const c_type*>(src_hsd.data_ptr()),
-            reinterpret_cast<c_type*>(dst_hsd.data_ptr()),
-            starts.stride(0),
-            starts.stride(1),
-            src_hsd.stride(0),
-            src_hsd.stride(1),
-            src_hsd.stride(2),
-            src_hsd.stride(3),
-            dst_hsd.stride(0),
-            dst_hsd.stride(1),
-            dst_hsd.stride(2),
-            dst_hsd.stride(3),
-            starts_bsz,
-            n_kv_heads,
-            page_size,
-            page_begin,
-            head_dim);
+    if (threads == 64) {
+      echo_recall_dense_from_starts_kernel<c_type>
+          <<<grid, 64, 0, stream>>>(
+              starts.data_ptr<int32_t>(),
+              reinterpret_cast<const c_type*>(src_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_hsd.data_ptr()),
+              starts.stride(0),
+              starts.stride(1),
+              src_hsd.stride(0),
+              src_hsd.stride(1),
+              src_hsd.stride(2),
+              src_hsd.stride(3),
+              dst_hsd.stride(0),
+              dst_hsd.stride(1),
+              dst_hsd.stride(2),
+              dst_hsd.stride(3),
+              starts_bsz,
+              n_kv_heads,
+              page_size,
+              page_begin,
+              head_dim);
+    } else if (threads == 128) {
+      echo_recall_dense_from_starts_kernel<c_type>
+          <<<grid, 128, 0, stream>>>(
+              starts.data_ptr<int32_t>(),
+              reinterpret_cast<const c_type*>(src_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_hsd.data_ptr()),
+              starts.stride(0),
+              starts.stride(1),
+              src_hsd.stride(0),
+              src_hsd.stride(1),
+              src_hsd.stride(2),
+              src_hsd.stride(3),
+              dst_hsd.stride(0),
+              dst_hsd.stride(1),
+              dst_hsd.stride(2),
+              dst_hsd.stride(3),
+              starts_bsz,
+              n_kv_heads,
+              page_size,
+              page_begin,
+              head_dim);
+    } else {
+      echo_recall_dense_from_starts_kernel<c_type>
+          <<<grid, 256, 0, stream>>>(
+              starts.data_ptr<int32_t>(),
+              reinterpret_cast<const c_type*>(src_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_hsd.data_ptr()),
+              starts.stride(0),
+              starts.stride(1),
+              src_hsd.stride(0),
+              src_hsd.stride(1),
+              src_hsd.stride(2),
+              src_hsd.stride(3),
+              dst_hsd.stride(0),
+              dst_hsd.stride(1),
+              dst_hsd.stride(2),
+              dst_hsd.stride(3),
+              starts_bsz,
+              n_kv_heads,
+              page_size,
+              page_begin,
+              head_dim);
+    }
     return true;
   });
 
@@ -1246,7 +1290,7 @@ void echo_recall_dense_kv_from_starts_cuda(
     }
   }
 
-  const int threads = 128;
+  const int threads = (head_dim <= 64) ? 64 : ((head_dim <= 128) ? 128 : 256);
   const int64_t dst_tokens = page_count * page_size;
   const int blocks_d = static_cast<int>((head_dim + threads - 1) / threads);
   TORCH_CHECK(blocks_d > 0, "invalid head_dim for launch");
@@ -1259,28 +1303,76 @@ void echo_recall_dense_kv_from_starts_cuda(
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE(src_k_hsd.scalar_type(), c_type, [&] {
-    echo_recall_dense_kv_from_starts_kernel<c_type>
-        <<<grid, threads, 0, stream>>>(
-            starts.data_ptr<int32_t>(),
-            reinterpret_cast<const c_type*>(src_k_hsd.data_ptr()),
-            reinterpret_cast<const c_type*>(src_v_hsd.data_ptr()),
-            reinterpret_cast<c_type*>(dst_k_hsd.data_ptr()),
-            reinterpret_cast<c_type*>(dst_v_hsd.data_ptr()),
-            starts.stride(0),
-            starts.stride(1),
-            src_k_hsd.stride(0),
-            src_k_hsd.stride(1),
-            src_k_hsd.stride(2),
-            src_k_hsd.stride(3),
-            dst_k_hsd.stride(0),
-            dst_k_hsd.stride(1),
-            dst_k_hsd.stride(2),
-            dst_k_hsd.stride(3),
-            starts_bsz,
-            n_kv_heads,
-            page_size,
-            page_begin,
-            head_dim);
+    if (threads == 64) {
+      echo_recall_dense_kv_from_starts_kernel<c_type>
+          <<<grid, 64, 0, stream>>>(
+              starts.data_ptr<int32_t>(),
+              reinterpret_cast<const c_type*>(src_k_hsd.data_ptr()),
+              reinterpret_cast<const c_type*>(src_v_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_k_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_v_hsd.data_ptr()),
+              starts.stride(0),
+              starts.stride(1),
+              src_k_hsd.stride(0),
+              src_k_hsd.stride(1),
+              src_k_hsd.stride(2),
+              src_k_hsd.stride(3),
+              dst_k_hsd.stride(0),
+              dst_k_hsd.stride(1),
+              dst_k_hsd.stride(2),
+              dst_k_hsd.stride(3),
+              starts_bsz,
+              n_kv_heads,
+              page_size,
+              page_begin,
+              head_dim);
+    } else if (threads == 128) {
+      echo_recall_dense_kv_from_starts_kernel<c_type>
+          <<<grid, 128, 0, stream>>>(
+              starts.data_ptr<int32_t>(),
+              reinterpret_cast<const c_type*>(src_k_hsd.data_ptr()),
+              reinterpret_cast<const c_type*>(src_v_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_k_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_v_hsd.data_ptr()),
+              starts.stride(0),
+              starts.stride(1),
+              src_k_hsd.stride(0),
+              src_k_hsd.stride(1),
+              src_k_hsd.stride(2),
+              src_k_hsd.stride(3),
+              dst_k_hsd.stride(0),
+              dst_k_hsd.stride(1),
+              dst_k_hsd.stride(2),
+              dst_k_hsd.stride(3),
+              starts_bsz,
+              n_kv_heads,
+              page_size,
+              page_begin,
+              head_dim);
+    } else {
+      echo_recall_dense_kv_from_starts_kernel<c_type>
+          <<<grid, 256, 0, stream>>>(
+              starts.data_ptr<int32_t>(),
+              reinterpret_cast<const c_type*>(src_k_hsd.data_ptr()),
+              reinterpret_cast<const c_type*>(src_v_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_k_hsd.data_ptr()),
+              reinterpret_cast<c_type*>(dst_v_hsd.data_ptr()),
+              starts.stride(0),
+              starts.stride(1),
+              src_k_hsd.stride(0),
+              src_k_hsd.stride(1),
+              src_k_hsd.stride(2),
+              src_k_hsd.stride(3),
+              dst_k_hsd.stride(0),
+              dst_k_hsd.stride(1),
+              dst_k_hsd.stride(2),
+              dst_k_hsd.stride(3),
+              starts_bsz,
+              n_kv_heads,
+              page_size,
+              page_begin,
+              head_dim);
+    }
     return true;
   });
 
