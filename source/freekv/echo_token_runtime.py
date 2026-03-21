@@ -853,6 +853,7 @@ class EchoTokenPrefetchRuntime:
         stream_chunk_pages: int = 4,
         stream_prefetch_only: bool = True,
         prefetch_pack_buffers: bool = False,
+        a100_fast_prefetch: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -875,6 +876,7 @@ class EchoTokenPrefetchRuntime:
         self.stream_chunk_pages = int(max(1, stream_chunk_pages))
         self.stream_prefetch_only = bool(stream_prefetch_only)
         self.prefetch_pack_buffers = bool(prefetch_pack_buffers)
+        self.a100_fast_prefetch = bool(a100_fast_prefetch)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -932,6 +934,8 @@ class EchoTokenPrefetchRuntime:
         self.prefetch_hint_seq_len = -1
         self.slide_half_window = self.page_size // 2
         self._head_idx = None
+        self._is_a100 = False
+        self._sm = 0
 
     def _ensure_dense_gpu_buffers(self, need_tokens: int):
         if need_tokens <= 0:
@@ -991,6 +995,11 @@ class EchoTokenPrefetchRuntime:
         self.dtype = dtype
         self.batch_size = bsz
         self.eff_batch = eff_bsz
+        if device.type == "cuda":
+            props = torch.cuda.get_device_properties(device)
+            self._sm = int(props.major * 10 + props.minor)
+            name = str(getattr(props, "name", "")).lower()
+            self._is_a100 = "a100" in name
 
         if self.recall_stream is None:
             self.recall_stream = torch.cuda.Stream(device)
@@ -2263,6 +2272,8 @@ class EchoTokenPrefetchRuntime:
 
         has_delta_partial = hasattr(kernels, "recall_tokens_delta_linear_partial")
         has_linear_partial = hasattr(kernels, "recall_tokens_linear_partial")
+        has_delta_full = hasattr(kernels, "recall_tokens_delta_linear")
+        has_linear_full = hasattr(kernels, "recall_tokens_linear")
         if (not has_delta_partial) and (not has_linear_partial):
             return False
 
@@ -2306,91 +2317,138 @@ class EchoTokenPrefetchRuntime:
         self.recall_stream.wait_stream(cur_stream)
 
         chunk_pages = int(max(1, min(self.stream_chunk_pages, self.mid_pages)))
+        use_a100_full_fast = bool(
+            self.a100_fast_prefetch
+            and self._is_a100
+            and has_cuda_pagemax_only_reduced
+            and (has_delta_full or has_linear_full)
+        )
         with torch.cuda.stream(self.recall_stream):
-            for p0 in range(0, self.mid_pages, chunk_pages):
-                p_count = int(min(chunk_pages, self.mid_pages - p0))
-                tok_begin = int(self.sink_len + p0 * self.page_size)
-                tok_end = int(tok_begin + p_count * self.page_size)
-
-                local_best_chunk = None
-                qh_best = None
-                if has_cuda_pagemax_only_reduced:
-                    try:
-                        local_best_chunk = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
-                            q_compact,
-                            local_k,
-                            self.n_q_per_kv,
-                            tok_begin,
-                            self.page_size,
-                            p_count,
-                        )
-                    except Exception:
-                        local_best_chunk = None
-                if local_best_chunk is None and has_cuda_pagemax_only:
-                    try:
-                        qh_best = kernels.echo_decode_qk_pagemax_chunk_only(
-                            q_compact,
-                            local_k,
-                            self.n_q_per_kv,
-                            tok_begin,
-                            self.page_size,
-                            p_count,
-                        )
-                    except Exception:
-                        qh_best = None
-
-                if local_best_chunk is None and qh_best is None:
-                    chunk_scores, qh_best = _triton_flash_decode_qk_select(
-                        q_compact,
-                        local_k[:, :, tok_begin:tok_end],
-                        n_q_per_kv=self.n_q_per_kv,
-                        page_size=self.page_size,
-                        mid_start=0,
-                        mid_pages=p_count,
-                        max_tokens=p_count * self.page_size,
-                    )
-                    if chunk_scores is None or qh_best is None:
-                        return False
-
-                if local_best_chunk is None:
-                    local_best_chunk = qh_best.view(
-                        eff, self.n_kv_heads, self.n_q_per_kv, p_count
-                    ).float().mean(dim=(1, 2)).round().to(torch.int32)
-                local_best_chunk_cpu = local_best_chunk.to(
+            if use_a100_full_fast:
+                local_best_all = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
+                    q_compact,
+                    local_k,
+                    self.n_q_per_kv,
+                    int(self.sink_len),
+                    self.page_size,
+                    self.mid_pages,
+                )
+                local_best_cpu = local_best_all.to(
                     device=torch.device("cpu"), dtype=torch.int32
                 )
-                local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
-
-                starts_chunk = self.active_starts[:, p0 : p0 + p_count] + local_best_chunk_cpu
-                starts_chunk = torch.clamp(
-                    starts_chunk - int(self.slide_half_window),
-                    min=lower,
-                    max=max_start,
-                ).to(dtype=torch.int32)
-                starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
-
-                if has_delta_partial and self.active_starts is not None:
-                    kernels.recall_tokens_delta_linear_partial(
+                local_best_full.copy_(local_best_cpu, non_blocking=False)
+                starts_full.copy_(
+                    torch.clamp(
+                        self.active_starts + local_best_cpu - int(self.slide_half_window),
+                        min=lower,
+                        max=max_start,
+                    ).to(dtype=torch.int32),
+                    non_blocking=False,
+                )
+                if has_delta_full and self.active_starts is not None:
+                    kernels.recall_tokens_delta_linear(
                         starts_dev,
                         prev_starts_dev,
                         self.cpu_kv[: self.eff_batch],
                         self.gpu_mid[self.active_idx],
                         out_buf,
                         self.cpu_len,
-                        p0,
-                        p_count,
                     )
-                elif has_linear_partial:
-                    kernels.recall_tokens_linear_partial(
+                elif has_linear_full:
+                    kernels.recall_tokens_linear(
                         starts_dev,
                         self.cpu_kv[: self.eff_batch],
                         out_buf,
                         self.cpu_len,
-                        p0,
-                        p_count,
                     )
                 else:
-                    self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
+                    # Should not happen due to use_a100_full_fast guard.
+                    self._fallback_recall(starts_dev, out_buf)
+            else:
+                for p0 in range(0, self.mid_pages, chunk_pages):
+                    p_count = int(min(chunk_pages, self.mid_pages - p0))
+                    tok_begin = int(self.sink_len + p0 * self.page_size)
+                    tok_end = int(tok_begin + p_count * self.page_size)
+
+                    local_best_chunk = None
+                    qh_best = None
+                    if has_cuda_pagemax_only_reduced:
+                        try:
+                            local_best_chunk = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
+                                q_compact,
+                                local_k,
+                                self.n_q_per_kv,
+                                tok_begin,
+                                self.page_size,
+                                p_count,
+                            )
+                        except Exception:
+                            local_best_chunk = None
+                    if local_best_chunk is None and has_cuda_pagemax_only:
+                        try:
+                            qh_best = kernels.echo_decode_qk_pagemax_chunk_only(
+                                q_compact,
+                                local_k,
+                                self.n_q_per_kv,
+                                tok_begin,
+                                self.page_size,
+                                p_count,
+                            )
+                        except Exception:
+                            qh_best = None
+
+                    if local_best_chunk is None and qh_best is None:
+                        chunk_scores, qh_best = _triton_flash_decode_qk_select(
+                            q_compact,
+                            local_k[:, :, tok_begin:tok_end],
+                            n_q_per_kv=self.n_q_per_kv,
+                            page_size=self.page_size,
+                            mid_start=0,
+                            mid_pages=p_count,
+                            max_tokens=p_count * self.page_size,
+                        )
+                        if chunk_scores is None or qh_best is None:
+                            return False
+
+                    if local_best_chunk is None:
+                        local_best_chunk = qh_best.view(
+                            eff, self.n_kv_heads, self.n_q_per_kv, p_count
+                        ).float().mean(dim=(1, 2)).round().to(torch.int32)
+                    local_best_chunk_cpu = local_best_chunk.to(
+                        device=torch.device("cpu"), dtype=torch.int32
+                    )
+                    local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
+
+                    starts_chunk = self.active_starts[:, p0 : p0 + p_count] + local_best_chunk_cpu
+                    starts_chunk = torch.clamp(
+                        starts_chunk - int(self.slide_half_window),
+                        min=lower,
+                        max=max_start,
+                    ).to(dtype=torch.int32)
+                    starts_full[:, p0 : p0 + p_count].copy_(starts_chunk)
+
+                    if has_delta_partial and self.active_starts is not None:
+                        kernels.recall_tokens_delta_linear_partial(
+                            starts_dev,
+                            prev_starts_dev,
+                            self.cpu_kv[: self.eff_batch],
+                            self.gpu_mid[self.active_idx],
+                            out_buf,
+                            self.cpu_len,
+                            p0,
+                            p_count,
+                        )
+                    elif has_linear_partial:
+                        kernels.recall_tokens_linear_partial(
+                            starts_dev,
+                            self.cpu_kv[: self.eff_batch],
+                            out_buf,
+                            self.cpu_len,
+                            p0,
+                            p_count,
+                        )
+                    else:
+                        self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
 
             anchors = (self.active_starts + local_best_full).to(
                 device=torch.device("cpu"), dtype=torch.int32

@@ -206,6 +206,9 @@ class InferState:
         self.echo_stream_prefetch_only = bool(
             kwargs.get("echo_stream_prefetch_only", True)
         )
+        self.echo_a100_fast_prefetch = bool(
+            kwargs.get("echo_a100_fast_prefetch", True)
+        )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "flash_attn")).lower()
         self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "split_overlap")).lower()
@@ -337,6 +340,7 @@ class InferState:
                     enable_page_kv=enable_page_kv,
                     stream_chunk_pages=self.echo_stream_chunk_pages,
                     stream_prefetch_only=self.echo_stream_prefetch_only,
+                    a100_fast_prefetch=self.echo_a100_fast_prefetch,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
