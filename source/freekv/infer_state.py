@@ -197,7 +197,10 @@ class InferState:
             kwargs.get("echo_use_triton_flash_attn", True)
         )
         self.echo_use_triton_recall_a100 = bool(
-            kwargs.get("echo_use_triton_recall_a100", True)
+            kwargs.get("echo_use_triton_recall_a100", False)
+        )
+        self.echo_use_a100_sdpa_attn = bool(
+            kwargs.get("echo_use_a100_sdpa_attn", True)
         )
         self.echo_allow_anchor_overlap = bool(
             kwargs.get("echo_allow_anchor_overlap", True)
@@ -356,6 +359,7 @@ class InferState:
                     reduce_host_sync=self.echo_reduce_host_sync,
                     full_fast_pages_threshold=self.echo_full_fast_pages_threshold,
                     use_triton_recall_a100=self.echo_use_triton_recall_a100,
+                    use_a100_sdpa_attn=self.echo_use_a100_sdpa_attn,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -925,6 +929,7 @@ class InferState:
                     a100_serial_inplace = bool(
                         rt.a100_fast_prefetch
                         and (getattr(rt, "_is_a100", False) or getattr(rt, "_sm", 0) == 80)
+                        and (not getattr(rt, "use_a100_sdpa_attn", False))
                     )
                     if a100_serial_inplace:
                         # A100 path: prioritize lower copy traffic over overlap.

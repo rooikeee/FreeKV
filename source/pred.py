@@ -153,8 +153,12 @@ def parse_args(args=None):
                         help="Disable Triton QK page-argmax selector for EchoKV-token")
     parser.add_argument("--echo_disable_triton_flash_attn", action="store_true",
                         help="Disable Triton fused decode-attention(+anchor) for EchoKV-token")
+    parser.add_argument("--echo_enable_triton_recall_a100", action="store_true",
+                        help="Enable experimental A100 Triton dense recall path (default: off)")
     parser.add_argument("--echo_disable_triton_recall_a100", action="store_true",
-                        help="Disable A100-oriented Triton dense recall path")
+                        help="Force disable A100 Triton dense recall path")
+    parser.add_argument("--echo_disable_a100_sdpa_attn", action="store_true",
+                        help="Disable A100 SDPA attention fast path (enabled by default)")
     parser.add_argument("--echo_allow_flash_fallback", action="store_true",
                         help="Allow fallback when Triton flash path is unavailable")
     parser.add_argument("--disable_profile_timing", action="store_true",
@@ -186,6 +190,10 @@ def load_model_and_tokenizer(path):
     n_win_pages = args.recent // page_size
     echo_anchor_pages = max(0, page_budgets - n_sink_pages - n_win_pages)
     echo_anchor_tokens = echo_anchor_pages * page_size
+    use_triton_recall_a100 = bool(
+        args.echo_enable_triton_recall_a100 and (not args.echo_disable_triton_recall_a100)
+    )
+    use_a100_sdpa_attn = bool(not args.echo_disable_a100_sdpa_attn)
     print(f"\n{CYAN}{SEP}")
     print(f"  KV Cache Config: token_budget={token_budgets}, page_budget={page_budgets}, "
           f"page_size={page_size}, sink={args.sink}, recent={args.recent}, "
@@ -202,10 +210,11 @@ def load_model_and_tokenizer(path):
           f"lazy_cpu_copy={(not args.echo_disable_lazy_cpu_copy)}, "
           f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
           f"native_only={(not args.echo_disable_native_only)}, "
-          f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
-          f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
-          f"triton_recall_a100={(not args.echo_disable_triton_recall_a100)}, "
-          f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
+           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
+           f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
+           f"triton_recall_a100={use_triton_recall_a100}, "
+           f"a100_sdpa_attn={use_a100_sdpa_attn}, "
+           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}")
     print(f"{SEP}{RESET}\n")
     if token_budgets > 0:
         infer_state = adapter.enable_offload(
@@ -245,9 +254,8 @@ def load_model_and_tokenizer(path):
             echo_use_cuda_token_recall=(not args.echo_disable_cuda_token_recall),
             echo_use_triton_qk_select=(not args.echo_disable_triton_qk_select),
             echo_use_triton_flash_attn=(not args.echo_disable_triton_flash_attn),
-            echo_use_triton_recall_a100=(
-                not args.echo_disable_triton_recall_a100
-            ),
+            echo_use_triton_recall_a100=use_triton_recall_a100,
+            echo_use_a100_sdpa_attn=use_a100_sdpa_attn,
             echo_require_triton_flash=(not args.echo_allow_flash_fallback),
             profile_timing=(not args.disable_profile_timing),
         )

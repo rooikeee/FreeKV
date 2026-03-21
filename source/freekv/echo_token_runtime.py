@@ -984,6 +984,7 @@ class EchoTokenPrefetchRuntime:
         reduce_host_sync: bool = True,
         full_fast_pages_threshold: int = 64,
         use_triton_recall_a100: bool = True,
+        use_a100_sdpa_attn: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -1011,6 +1012,7 @@ class EchoTokenPrefetchRuntime:
         self.reduce_host_sync = bool(reduce_host_sync)
         self.full_fast_pages_threshold = int(max(1, full_fast_pages_threshold))
         self.use_triton_recall_a100 = bool(use_triton_recall_a100 and (triton is not None))
+        self.use_a100_sdpa_attn = bool(use_a100_sdpa_attn)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -1074,6 +1076,9 @@ class EchoTokenPrefetchRuntime:
         self._sm = 0
         self._a100_fast_reported = False
         self._a100_triton_recall_reported = False
+        self._a100_sdpa_attn_reported = False
+        self._flash_attn_pkg_needs_contig: Optional[bool] = None
+        self._flash_attn_pkg_needs_repeat: Optional[bool] = None
 
     def _ensure_dense_gpu_buffers(self, need_tokens: int):
         if need_tokens <= 0:
@@ -1274,6 +1279,9 @@ class EchoTokenPrefetchRuntime:
         self._head_idx = None
         self._a100_fast_reported = False
         self._a100_triton_recall_reported = False
+        self._a100_sdpa_attn_reported = False
+        self._flash_attn_pkg_needs_contig = None
+        self._flash_attn_pkg_needs_repeat = None
         self.dense_len = 0
         self.cpu_synced_len = 0
 
@@ -2447,10 +2455,15 @@ class EchoTokenPrefetchRuntime:
             active_starts_cpu = active_starts_cpu.to(
                 device=torch.device("cpu"), dtype=torch.int32
             ).contiguous()
-        starts_full_gpu = active_starts_cpu.to(
-            device=q_compact.device, dtype=torch.int32, non_blocking=True
-        ).contiguous()
-        starts_full_cpu = None
+        use_gpu_starts = bool(can_triton_recall)
+        if use_gpu_starts:
+            starts_full_gpu = active_starts_cpu.to(
+                device=q_compact.device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+            starts_full_cpu = None
+        else:
+            starts_full_gpu = None
+            starts_full_cpu = active_starts_cpu.clone()
         local_best_full = torch.empty(
             (eff, self.mid_pages), dtype=torch.int32, device=torch.device("cpu")
         )
@@ -2502,40 +2515,53 @@ class EchoTokenPrefetchRuntime:
             )
             local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
 
-            starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
-            starts_chunk_gpu = torch.clamp(
-                starts_chunk_gpu - int(self.slide_half_window),
-                min=lower,
-                max=max_start,
-            ).to(dtype=torch.int32)
-            starts_full_gpu[:, p0 : p0 + p_count].copy_(starts_chunk_gpu, non_blocking=True)
+            if use_gpu_starts:
+                starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
+                starts_chunk_gpu = torch.clamp(
+                    starts_chunk_gpu - int(self.slide_half_window),
+                    min=lower,
+                    max=max_start,
+                ).to(dtype=torch.int32)
+                starts_full_gpu[:, p0 : p0 + p_count].copy_(
+                    starts_chunk_gpu, non_blocking=True
+                )
+            else:
+                starts_chunk_cpu = starts_full_cpu[:, p0 : p0 + p_count] + local_best_chunk_cpu
+                starts_chunk_cpu = torch.clamp(
+                    starts_chunk_cpu - int(self.slide_half_window),
+                    min=lower,
+                    max=max_start,
+                ).to(dtype=torch.int32)
+                starts_full_cpu[:, p0 : p0 + p_count].copy_(starts_chunk_cpu)
 
             with torch.cuda.stream(self.recall_stream):
                 used_triton_partial = False
-                try:
-                    used_triton_partial = self._triton_recall_from_dense(
-                        starts_full_gpu,
-                        out_buf,
-                        p0,
-                        p_count,
-                    )
-                except Exception:
-                    used_triton_partial = False
+                if use_gpu_starts:
+                    try:
+                        used_triton_partial = self._triton_recall_from_dense(
+                            starts_full_gpu,
+                            out_buf,
+                            p0,
+                            p_count,
+                        )
+                    except Exception:
+                        used_triton_partial = False
 
                 if used_triton_partial:
                     continue
 
-                if starts_full_cpu is None:
-                    starts_full_cpu = starts_full_gpu.to(
-                        device=torch.device("cpu"), dtype=torch.int32
-                    ).contiguous()
-                else:
-                    starts_full_cpu[:, p0 : p0 + p_count].copy_(
-                        starts_chunk_gpu.to(
+                if use_gpu_starts:
+                    if starts_full_cpu is None:
+                        starts_full_cpu = starts_full_gpu.to(
                             device=torch.device("cpu"), dtype=torch.int32
-                        ),
-                        non_blocking=False,
-                    )
+                        ).contiguous()
+                    else:
+                        starts_full_cpu[:, p0 : p0 + p_count].copy_(
+                            starts_chunk_gpu.to(
+                                device=torch.device("cpu"), dtype=torch.int32
+                            ),
+                            non_blocking=False,
+                        )
 
                 if has_delta_partial and self.active_starts is not None:
                     kernels.recall_tokens_delta_linear_partial(
@@ -2697,10 +2723,15 @@ class EchoTokenPrefetchRuntime:
             active_starts_cpu = active_starts_cpu.to(
                 device=torch.device("cpu"), dtype=torch.int32
             ).contiguous()
-        starts_full_gpu = active_starts_cpu.to(
-            device=q_compact.device, dtype=torch.int32, non_blocking=True
-        ).contiguous()
-        starts_full_cpu = None
+        use_gpu_starts = bool(can_triton_recall)
+        if use_gpu_starts:
+            starts_full_gpu = active_starts_cpu.to(
+                device=q_compact.device, dtype=torch.int32, non_blocking=True
+            ).contiguous()
+            starts_full_cpu = None
+        else:
+            starts_full_gpu = None
+            starts_full_cpu = active_starts_cpu.clone()
 
         pending_idx = self.active_idx if allow_inplace_delta else (1 - self.active_idx)
         out_buf = self.gpu_mid[pending_idx]
@@ -2757,31 +2788,52 @@ class EchoTokenPrefetchRuntime:
                     ).float().mean(dim=(1, 2)).round().to(torch.int32)
                 if local_best_all is None:
                     return False
-                starts_full_gpu.copy_(
-                    torch.clamp(
-                        starts_full_gpu + local_best_all - int(self.slide_half_window),
-                        min=lower,
-                        max=max_start,
-                    ).to(dtype=torch.int32),
-                    non_blocking=True,
-                )
-                # A100 path: sort starts to improve contiguous run detection in
-                # recall memcpy scheduling (attention is permutation-invariant).
-                if use_a100_full_fast:
+                if use_gpu_starts:
                     starts_full_gpu.copy_(
-                        torch.sort(starts_full_gpu, dim=-1).values.to(dtype=torch.int32),
+                        torch.clamp(
+                            starts_full_gpu + local_best_all - int(self.slide_half_window),
+                            min=lower,
+                            max=max_start,
+                        ).to(dtype=torch.int32),
                         non_blocking=True,
                     )
-                used_triton_full = False
-                try:
-                    used_triton_full = self._triton_recall_from_dense(
-                        starts_full_gpu,
-                        out_buf,
+                    # A100 path: sort starts to improve contiguous run detection in
+                    # recall memcpy scheduling (attention is permutation-invariant).
+                    if use_a100_full_fast:
+                        starts_full_gpu.copy_(
+                            torch.sort(starts_full_gpu, dim=-1).values.to(dtype=torch.int32),
+                            non_blocking=True,
+                        )
+                else:
+                    local_best_cpu = local_best_all.to(
+                        device=torch.device("cpu"), dtype=torch.int32
                     )
-                except Exception:
-                    used_triton_full = False
+                    starts_full_cpu.copy_(
+                        torch.clamp(
+                            starts_full_cpu + local_best_cpu - int(self.slide_half_window),
+                            min=lower,
+                            max=max_start,
+                        ).to(dtype=torch.int32),
+                        non_blocking=False,
+                    )
+                    if use_a100_full_fast:
+                        starts_full_cpu.copy_(
+                            torch.sort(starts_full_cpu, dim=-1).values.to(
+                                device=torch.device("cpu"), dtype=torch.int32
+                            ),
+                            non_blocking=False,
+                        )
+                used_triton_full = False
+                if use_gpu_starts:
+                    try:
+                        used_triton_full = self._triton_recall_from_dense(
+                            starts_full_gpu,
+                            out_buf,
+                        )
+                    except Exception:
+                        used_triton_full = False
                 if not used_triton_full:
-                    if starts_full_cpu is None:
+                    if use_gpu_starts and starts_full_cpu is None:
                         starts_full_cpu = starts_full_gpu.to(
                             device=torch.device("cpu"), dtype=torch.int32
                         ).contiguous()
@@ -2854,41 +2906,59 @@ class EchoTokenPrefetchRuntime:
                         local_best_chunk = qh_best.view(
                             eff, self.n_kv_heads, self.n_q_per_kv, p_count
                         ).float().mean(dim=(1, 2)).round().to(torch.int32)
-                    starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
-                    starts_chunk_gpu = torch.clamp(
-                        starts_chunk_gpu - int(self.slide_half_window),
-                        min=lower,
-                        max=max_start,
-                    ).to(dtype=torch.int32)
-                    starts_full_gpu[:, p0 : p0 + p_count].copy_(
-                        starts_chunk_gpu, non_blocking=True
+                    local_best_chunk_cpu = local_best_chunk.to(
+                        device=torch.device("cpu"), dtype=torch.int32
                     )
+                    if use_gpu_starts:
+                        starts_chunk_gpu = (
+                            starts_full_gpu[:, p0 : p0 + p_count] + local_best_chunk
+                        )
+                        starts_chunk_gpu = torch.clamp(
+                            starts_chunk_gpu - int(self.slide_half_window),
+                            min=lower,
+                            max=max_start,
+                        ).to(dtype=torch.int32)
+                        starts_full_gpu[:, p0 : p0 + p_count].copy_(
+                            starts_chunk_gpu, non_blocking=True
+                        )
+                    else:
+                        starts_chunk_cpu = (
+                            starts_full_cpu[:, p0 : p0 + p_count] + local_best_chunk_cpu
+                        )
+                        starts_chunk_cpu = torch.clamp(
+                            starts_chunk_cpu - int(self.slide_half_window),
+                            min=lower,
+                            max=max_start,
+                        ).to(dtype=torch.int32)
+                        starts_full_cpu[:, p0 : p0 + p_count].copy_(starts_chunk_cpu)
 
                     used_triton_partial = False
-                    try:
-                        used_triton_partial = self._triton_recall_from_dense(
-                            starts_full_gpu,
-                            out_buf,
-                            p0,
-                            p_count,
-                        )
-                    except Exception:
-                        used_triton_partial = False
+                    if use_gpu_starts:
+                        try:
+                            used_triton_partial = self._triton_recall_from_dense(
+                                starts_full_gpu,
+                                out_buf,
+                                p0,
+                                p_count,
+                            )
+                        except Exception:
+                            used_triton_partial = False
 
                     if used_triton_partial:
                         continue
 
-                    if starts_full_cpu is None:
-                        starts_full_cpu = starts_full_gpu.to(
-                            device=torch.device("cpu"), dtype=torch.int32
-                        ).contiguous()
-                    else:
-                        starts_full_cpu[:, p0 : p0 + p_count].copy_(
-                            starts_chunk_gpu.to(
+                    if use_gpu_starts:
+                        if starts_full_cpu is None:
+                            starts_full_cpu = starts_full_gpu.to(
                                 device=torch.device("cpu"), dtype=torch.int32
-                            ),
-                            non_blocking=False,
-                        )
+                            ).contiguous()
+                        else:
+                            starts_full_cpu[:, p0 : p0 + p_count].copy_(
+                                starts_chunk_gpu.to(
+                                    device=torch.device("cpu"), dtype=torch.int32
+                                ),
+                                non_blocking=False,
+                            )
 
                     if has_delta_partial and self.active_starts is not None:
                         kernels.recall_tokens_delta_linear_partial(
@@ -3108,6 +3178,20 @@ class EchoTokenPrefetchRuntime:
         else:
             q_use = q
 
+        can_use_a100_sdpa = bool(
+            (not strict)
+            and self.use_a100_sdpa_attn
+            and (self._is_a100 or self._sm == 80)
+        )
+        if can_use_a100_sdpa:
+            if not self._a100_sdpa_attn_reported:
+                self._a100_sdpa_attn_reported = True
+                print(
+                    "[EchoKV] A100 SDPA attention fast-path enabled: "
+                    f"sm={self._sm}, mid_pages={self.mid_pages}"
+                )
+            return self.attend(q, local_k, local_v)
+
         out = None
         prefer_pkg = bool(self.prefer_flash_attn_package)
 
@@ -3121,35 +3205,54 @@ class EchoTokenPrefetchRuntime:
             if flash_attn_func is None:
                 return None
             q_in = q_use.contiguous()  # [eff, 1, n_q_heads, d]
-            k_in = local_k.transpose(1, 2).contiguous()  # [eff, s, n_kv_heads, d]
-            v_in = local_v.transpose(1, 2).contiguous()
-            try:
-                # Prefer native GQA path to avoid per-step key/value head expansion.
-                return flash_attn_func(
-                    q_in,
-                    k_in,
-                    v_in,
-                    dropout_p=0.0,
-                    softmax_scale=None,
-                    causal=False,
-                )
-            except Exception:
-                if self.n_q_per_kv <= 1:
-                    raise
-                k_rep = k_in.repeat_interleave(self.n_q_per_kv, dim=2)
-                v_rep = v_in.repeat_interleave(self.n_q_per_kv, dim=2)
-                return flash_attn_func(
-                    q_in,
-                    k_rep,
-                    v_rep,
-                    dropout_p=0.0,
-                    softmax_scale=None,
-                    causal=False,
-                )
-            except Exception:
-                if strict and prefer_pkg:
-                    raise
-                return None
+            k_view = local_k.transpose(1, 2)  # [eff, s, n_kv_heads, d]
+            v_view = local_v.transpose(1, 2)
+
+            if self._flash_attn_pkg_needs_contig is None:
+                contig_candidates = [False, True]
+            else:
+                contig_candidates = [bool(self._flash_attn_pkg_needs_contig)]
+            if self.n_q_per_kv <= 1:
+                repeat_candidates = [False]
+            elif self._flash_attn_pkg_needs_repeat is None:
+                # Prefer native GQA path first to avoid head expansion.
+                repeat_candidates = [False, True]
+            else:
+                repeat_candidates = [bool(self._flash_attn_pkg_needs_repeat)]
+
+            last_exc: Optional[Exception] = None
+            for needs_contig in contig_candidates:
+                if needs_contig:
+                    k_base = k_view.contiguous()
+                    v_base = v_view.contiguous()
+                else:
+                    k_base = k_view
+                    v_base = v_view
+                for needs_repeat in repeat_candidates:
+                    if needs_repeat:
+                        k_in = k_base.repeat_interleave(self.n_q_per_kv, dim=2)
+                        v_in = v_base.repeat_interleave(self.n_q_per_kv, dim=2)
+                    else:
+                        k_in = k_base
+                        v_in = v_base
+                    try:
+                        out_pkg = flash_attn_func(
+                            q_in,
+                            k_in,
+                            v_in,
+                            dropout_p=0.0,
+                            softmax_scale=None,
+                            causal=False,
+                        )
+                        self._flash_attn_pkg_needs_contig = bool(needs_contig)
+                        self._flash_attn_pkg_needs_repeat = bool(needs_repeat)
+                        return out_pkg
+                    except Exception as e:
+                        last_exc = e
+                        continue
+            if strict and prefer_pkg and last_exc is not None:
+                raise last_exc
+            return None
 
         if prefer_pkg:
             out = _call_flash_attn_pkg()
