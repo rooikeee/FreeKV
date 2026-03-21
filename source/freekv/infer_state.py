@@ -933,7 +933,7 @@ class InferState:
                     hasattr(rt, "should_force_cuda_chunk_attn")
                     and rt.should_force_cuda_chunk_attn()
                 )
-                use_stream_prefetch_only = bool(rt.stream_prefetch_only and (not force_cuda_chunk_attn))
+                use_stream_prefetch_only = bool(rt.stream_prefetch_only or force_cuda_chunk_attn)
                 if use_stream_prefetch_only:
                     a100_serial_inplace = bool(
                         rt.a100_fast_prefetch

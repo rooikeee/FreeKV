@@ -1804,8 +1804,6 @@ class EchoTokenPrefetchRuntime:
             return
         if starts.dtype != torch.int32 or (not starts.is_contiguous()):
             starts = starts.to(dtype=torch.int32).contiguous()
-        if starts.device.type != "cpu":
-            starts = starts.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
         self.prefetch_hint_starts = starts
         self.prefetch_hint_seq_len = int(target_seq_len)
 
@@ -1824,10 +1822,13 @@ class EchoTokenPrefetchRuntime:
         if max_start < lower:
             return None
 
-        local_best_cpu_i32 = local_best_cpu_i32.to(
-            device=torch.device("cpu"), dtype=torch.int32
+        active_starts_i32 = self.active_starts
+        if active_starts_i32.dtype != torch.int32 or (not active_starts_i32.is_contiguous()):
+            active_starts_i32 = active_starts_i32.to(dtype=torch.int32).contiguous()
+        local_best_i32 = local_best_cpu_i32.to(
+            device=active_starts_i32.device, dtype=torch.int32
         ).contiguous()
-        starts = self.active_starts + local_best_cpu_i32 - int(self.slide_half_window)
+        starts = active_starts_i32 + local_best_i32 - int(self.slide_half_window)
         starts = torch.clamp(starts, min=lower, max=max_start)
         return starts.to(dtype=torch.int32).contiguous()
 
@@ -1846,7 +1847,7 @@ class EchoTokenPrefetchRuntime:
             # Backward-compatible fix: collapse accidental [eff, heads, pages]
             # anchors to the shared [eff, pages] layout used by recall.
             anchors = anchors.to(torch.float32).mean(dim=1).round().to(torch.int32)
-            self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+            self.anchors = anchors.to(dtype=torch.int32).contiguous()
         if anchors.dim() != 2:
             raise RuntimeError(
                 f"EchoKV anchors must be 2D [eff_bsz, mid_pages], got shape={tuple(anchors.shape)}"
@@ -2087,7 +2088,7 @@ class EchoTokenPrefetchRuntime:
             starts_i32 = starts.to(dtype=torch.int32).contiguous()
         else:
             starts_i32 = starts
-        starts_cpu = starts_i32 if starts_i32.device.type == "cpu" else starts_i32.to("cpu")
+        starts_cpu = None
         pending_idx = 1 - self.active_idx
         out_buf = self.gpu_mid[pending_idx]
 
@@ -2147,6 +2148,12 @@ class EchoTokenPrefetchRuntime:
 
             if (not used_triton) and (not used_delta) and allow_inplace_delta and self.active_starts is not None:
                 # Fallback path when delta kernel is unavailable.
+                if starts_cpu is None:
+                    starts_cpu = (
+                        starts_i32
+                        if starts_i32.device.type == "cpu"
+                        else starts_i32.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+                    )
                 used_delta = self._delta_recall_from_active(
                     starts_cpu, self.gpu_mid[self.active_idx], in_place=True
                 )
@@ -2172,6 +2179,12 @@ class EchoTokenPrefetchRuntime:
                 except Exception:
                     used_cuda = False
             if (not used_triton) and (not used_delta) and (not used_cuda):
+                if starts_cpu is None:
+                    starts_cpu = (
+                        starts_i32
+                        if starts_i32.device.type == "cpu"
+                        else starts_i32.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+                    )
                 self._fallback_recall(starts_cpu, out_buf)
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
@@ -2209,7 +2222,7 @@ class EchoTokenPrefetchRuntime:
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
-        self.pending_starts = starts
+        self.pending_starts = starts_i32
         self.prefetch_ready = True
 
     def activate_prefetch(self, seq_len: int, compute_stream: torch.cuda.Stream):
@@ -2334,12 +2347,13 @@ class EchoTokenPrefetchRuntime:
                 self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
             )
             local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
-        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
-        anchors = starts + local_best_cpu
+        starts_i32 = starts if starts.dtype == torch.int32 else starts.to(dtype=torch.int32)
+        local_best_i32 = local_best.to(device=starts_i32.device, dtype=torch.int32)
+        anchors = starts_i32 + local_best_i32
         anchors = self._maybe_sort_anchors(anchors)
-        self.anchors = anchors.to(device=torch.device("cpu"), dtype=torch.int32).contiguous()
+        self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
-            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self._starts_from_local_best(local_best_i32, self.cpu_len + 1),
             self.cpu_len + 1,
         )
 
@@ -2375,12 +2389,17 @@ class EchoTokenPrefetchRuntime:
                 self.eff_batch, scores.shape[1], self.mid_pages, self.page_size
             )
             local_best = page_probs.argmax(dim=-1).float().mean(dim=1).round().to(torch.int32)
-        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
-        anchors = self.active_starts + local_best_cpu
+        starts_i32 = (
+            self.active_starts
+            if self.active_starts.dtype == torch.int32
+            else self.active_starts.to(dtype=torch.int32)
+        )
+        local_best_i32 = local_best.to(device=starts_i32.device, dtype=torch.int32)
+        anchors = starts_i32 + local_best_i32
         anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
-            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self._starts_from_local_best(local_best_i32, self.cpu_len + 1),
             self.cpu_len + 1,
         )
 
@@ -2447,12 +2466,17 @@ class EchoTokenPrefetchRuntime:
         local_best = qh_best.view(
             qh_best.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
         ).float().mean(dim=(1, 2)).round().to(torch.int32)
-        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
-        anchors = self.active_starts + local_best_cpu
+        starts_i32 = (
+            self.active_starts
+            if self.active_starts.dtype == torch.int32
+            else self.active_starts.to(dtype=torch.int32)
+        )
+        local_best_i32 = local_best.to(device=starts_i32.device, dtype=torch.int32)
+        anchors = starts_i32 + local_best_i32
         anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
-            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self._starts_from_local_best(local_best_i32, self.cpu_len + 1),
             self.cpu_len + 1,
         )
         return scores
@@ -2522,22 +2546,27 @@ class EchoTokenPrefetchRuntime:
         # Fill sink segment scores first (no recall dependency).
         self._fill_qk_scores_segment(scores, q_compact, local_k, 0, self.sink_len)
 
-        active_starts_cpu = self.active_starts
-        if (
-            active_starts_cpu.device.type != "cpu"
-            or active_starts_cpu.dtype != torch.int32
-            or (not active_starts_cpu.is_contiguous())
-        ):
-            active_starts_cpu = active_starts_cpu.to(
-                device=torch.device("cpu"), dtype=torch.int32
-            ).contiguous()
+        active_starts_i32 = self.active_starts
+        if active_starts_i32.dtype != torch.int32 or (not active_starts_i32.is_contiguous()):
+            active_starts_i32 = active_starts_i32.to(dtype=torch.int32).contiguous()
         use_gpu_starts = bool(can_triton_recall or can_cuda_dense_recall)
         if use_gpu_starts:
-            starts_full_gpu = active_starts_cpu.to(
-                device=q_compact.device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
-            starts_full_cpu = None
+            if active_starts_i32.device.type == "cuda":
+                starts_full_gpu = active_starts_i32.clone()
+                starts_full_cpu = None
+            else:
+                starts_full_gpu = active_starts_i32.to(
+                    device=q_compact.device, dtype=torch.int32, non_blocking=True
+                ).contiguous()
+                starts_full_cpu = active_starts_i32
         else:
+            active_starts_cpu = (
+                active_starts_i32
+                if active_starts_i32.device.type == "cpu"
+                else active_starts_i32.to(
+                    device=torch.device("cpu"), dtype=torch.int32
+                ).contiguous()
+            )
             starts_full_gpu = None
             starts_full_cpu = active_starts_cpu.clone()
         local_best_full = torch.empty(
@@ -2548,7 +2577,7 @@ class EchoTokenPrefetchRuntime:
 
         pending_idx = 1 - self.active_idx
         out_buf = self.gpu_mid[pending_idx]
-        prev_starts_dev = active_starts_cpu
+        prev_starts_dev = starts_full_cpu
 
         chunk_pages = int(max(1, min(self.stream_chunk_pages, self.mid_pages)))
         for p0 in range(0, self.mid_pages, chunk_pages):
@@ -2638,6 +2667,14 @@ class EchoTokenPrefetchRuntime:
                         starts_full_cpu = starts_full_gpu.to(
                             device=torch.device("cpu"), dtype=torch.int32
                         ).contiguous()
+                        if prev_starts_dev is None:
+                            prev_starts_dev = (
+                                active_starts_i32
+                                if active_starts_i32.device.type == "cpu"
+                                else active_starts_i32.to(
+                                    device=torch.device("cpu"), dtype=torch.int32
+                                ).contiguous()
+                            )
                     else:
                         starts_full_cpu[:, p0 : p0 + p_count].copy_(
                             starts_chunk_gpu.to(
@@ -2678,20 +2715,17 @@ class EchoTokenPrefetchRuntime:
             seq_len,
         )
 
-        local_best_full_cpu = (
-            local_best_full.to(device=torch.device("cpu"), dtype=torch.int32)
-            if use_gpu_starts
-            else local_best_full
-        )
-        anchors = (self.active_starts + local_best_full_cpu).to(
-            device=torch.device("cpu"), dtype=torch.int32
+        local_best_for_anchor = local_best_full
+        if local_best_for_anchor.device != active_starts_i32.device:
+            local_best_for_anchor = local_best_for_anchor.to(
+                device=active_starts_i32.device, dtype=torch.int32
+            )
+        anchors = (active_starts_i32 + local_best_for_anchor).to(
+            dtype=torch.int32
         ).contiguous()
         self.anchors = anchors
-        if starts_full_cpu is None:
-            starts_full_cpu = starts_full_gpu.to(
-                device=torch.device("cpu"), dtype=torch.int32
-            ).contiguous()
-        self._set_prefetch_hint(starts_full_cpu, int(target_seq_len))
+        starts_for_state = starts_full_gpu if use_gpu_starts else starts_full_cpu
+        self._set_prefetch_hint(starts_for_state, int(target_seq_len))
 
         with torch.cuda.stream(self.recall_stream):
             self.pending_idx = pending_idx
@@ -2738,7 +2772,7 @@ class EchoTokenPrefetchRuntime:
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
-        self.pending_starts = starts_full_cpu
+        self.pending_starts = starts_for_state
         self.prefetch_ready = True
         return scores
 
@@ -2807,28 +2841,33 @@ class EchoTokenPrefetchRuntime:
         if max_start < lower:
             return False
 
-        active_starts_cpu = self.active_starts
-        if (
-            active_starts_cpu.device.type != "cpu"
-            or active_starts_cpu.dtype != torch.int32
-            or (not active_starts_cpu.is_contiguous())
-        ):
-            active_starts_cpu = active_starts_cpu.to(
-                device=torch.device("cpu"), dtype=torch.int32
-            ).contiguous()
+        active_starts_i32 = self.active_starts
+        if active_starts_i32.dtype != torch.int32 or (not active_starts_i32.is_contiguous()):
+            active_starts_i32 = active_starts_i32.to(dtype=torch.int32).contiguous()
         use_gpu_starts = bool(can_triton_recall or can_cuda_dense_recall)
         if use_gpu_starts:
-            starts_full_gpu = active_starts_cpu.to(
-                device=q_compact.device, dtype=torch.int32, non_blocking=True
-            ).contiguous()
-            starts_full_cpu = None
+            if active_starts_i32.device.type == "cuda":
+                starts_full_gpu = active_starts_i32.clone()
+                starts_full_cpu = None
+            else:
+                starts_full_gpu = active_starts_i32.to(
+                    device=q_compact.device, dtype=torch.int32, non_blocking=True
+                ).contiguous()
+                starts_full_cpu = active_starts_i32
         else:
+            active_starts_cpu = (
+                active_starts_i32
+                if active_starts_i32.device.type == "cpu"
+                else active_starts_i32.to(
+                    device=torch.device("cpu"), dtype=torch.int32
+                ).contiguous()
+            )
             starts_full_gpu = None
             starts_full_cpu = active_starts_cpu.clone()
 
         pending_idx = self.active_idx if allow_inplace_delta else (1 - self.active_idx)
         out_buf = self.gpu_mid[pending_idx]
-        prev_starts_dev = active_starts_cpu
+        prev_starts_dev = starts_full_cpu
 
         cur_stream = torch.cuda.current_stream(self.device)
         self.recall_stream.wait_stream(cur_stream)
@@ -2932,6 +2971,14 @@ class EchoTokenPrefetchRuntime:
                         starts_full_cpu = starts_full_gpu.to(
                             device=torch.device("cpu"), dtype=torch.int32
                         ).contiguous()
+                        if prev_starts_dev is None:
+                            prev_starts_dev = (
+                                active_starts_i32
+                                if active_starts_i32.device.type == "cpu"
+                                else active_starts_i32.to(
+                                    device=torch.device("cpu"), dtype=torch.int32
+                                ).contiguous()
+                            )
                     if has_delta_full and self.active_starts is not None:
                         kernels.recall_tokens_delta_linear(
                             starts_full_cpu,
@@ -3047,6 +3094,14 @@ class EchoTokenPrefetchRuntime:
                             starts_full_cpu = starts_full_gpu.to(
                                 device=torch.device("cpu"), dtype=torch.int32
                             ).contiguous()
+                            if prev_starts_dev is None:
+                                prev_starts_dev = (
+                                    active_starts_i32
+                                    if active_starts_i32.device.type == "cpu"
+                                    else active_starts_i32.to(
+                                        device=torch.device("cpu"), dtype=torch.int32
+                                    ).contiguous()
+                                )
                         else:
                             starts_full_cpu[:, p0 : p0 + p_count].copy_(
                                 starts_chunk_gpu.to(
@@ -3080,16 +3135,12 @@ class EchoTokenPrefetchRuntime:
                             starts_full_cpu, out_buf, p0, p_count
                         )
 
-            if starts_full_cpu is None:
-                starts_full_cpu = starts_full_gpu.to(
-                    device=torch.device("cpu"), dtype=torch.int32
-                ).contiguous()
-
-            anchors = (starts_full_cpu + int(self.slide_half_window)).to(
-                device=torch.device("cpu"), dtype=torch.int32
+            starts_for_state = starts_full_gpu if use_gpu_starts else starts_full_cpu
+            anchors = (starts_for_state + int(self.slide_half_window)).to(
+                dtype=torch.int32
             ).contiguous()
             self.anchors = anchors
-            self._set_prefetch_hint(starts_full_cpu, int(target_seq_len))
+            self._set_prefetch_hint(starts_for_state, int(target_seq_len))
 
             self.pending_idx = pending_idx
             self.local_mid_ready[pending_idx] = False
@@ -3135,7 +3186,7 @@ class EchoTokenPrefetchRuntime:
             self.prefetch_event.record(self.recall_stream)
 
         self.pending_seq_len = int(target_seq_len)
-        self.pending_starts = starts_full_cpu
+        self.pending_starts = starts_for_state
         self.prefetch_ready = True
         return True
 
@@ -3211,12 +3262,17 @@ class EchoTokenPrefetchRuntime:
         local_best = qh_best.view(
             fused_out.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
         ).float().mean(dim=(1, 2)).round().to(torch.int32)
-        local_best_cpu = local_best.to(device=torch.device("cpu"), dtype=torch.int32)
-        anchors = self.active_starts + local_best_cpu
+        starts_i32 = (
+            self.active_starts
+            if self.active_starts.dtype == torch.int32
+            else self.active_starts.to(dtype=torch.int32)
+        )
+        local_best_i32 = local_best.to(device=starts_i32.device, dtype=torch.int32)
+        anchors = starts_i32 + local_best_i32
         anchors = self._maybe_sort_anchors(anchors)
         self.anchors = anchors.to(dtype=torch.int32).contiguous()
         self._set_prefetch_hint(
-            self._starts_from_local_best(local_best_cpu, self.cpu_len + 1),
+            self._starts_from_local_best(local_best_i32, self.cpu_len + 1),
             self.cpu_len + 1,
         )
 
