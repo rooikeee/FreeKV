@@ -1077,6 +1077,8 @@ class EchoTokenPrefetchRuntime:
         self._a100_fast_reported = False
         self._a100_triton_recall_reported = False
         self._a100_sdpa_attn_reported = False
+        self._a100_attn_backend: Optional[str] = None
+        self._a100_attn_backend_reported = False
         self._flash_attn_pkg_needs_contig: Optional[bool] = None
         self._flash_attn_pkg_needs_repeat: Optional[bool] = None
 
@@ -1280,6 +1282,8 @@ class EchoTokenPrefetchRuntime:
         self._a100_fast_reported = False
         self._a100_triton_recall_reported = False
         self._a100_sdpa_attn_reported = False
+        self._a100_attn_backend = None
+        self._a100_attn_backend_reported = False
         self._flash_attn_pkg_needs_contig = None
         self._flash_attn_pkg_needs_repeat = None
         self.dense_len = 0
@@ -3178,20 +3182,6 @@ class EchoTokenPrefetchRuntime:
         else:
             q_use = q
 
-        can_use_a100_sdpa = bool(
-            (not strict)
-            and self.use_a100_sdpa_attn
-            and (self._is_a100 or self._sm == 80)
-        )
-        if can_use_a100_sdpa:
-            if not self._a100_sdpa_attn_reported:
-                self._a100_sdpa_attn_reported = True
-                print(
-                    "[EchoKV] A100 SDPA attention fast-path enabled: "
-                    f"sm={self._sm}, mid_pages={self.mid_pages}"
-                )
-            return self.attend(q, local_k, local_v)
-
         out = None
         prefer_pkg = bool(self.prefer_flash_attn_package)
 
@@ -3254,10 +3244,9 @@ class EchoTokenPrefetchRuntime:
                 raise last_exc
             return None
 
-        if prefer_pkg:
-            out = _call_flash_attn_pkg()
-
-        if out is None and self.use_triton_flash_attn:
+        def _call_triton_plain() -> Optional[torch.Tensor]:
+            if not self.use_triton_flash_attn:
+                return None
             q_compact = q_use[:, 0].contiguous()  # [eff, n_q_heads, d]
             out_compact = _triton_flash_decode_attn_plain(
                 q_compact,
@@ -3267,7 +3256,74 @@ class EchoTokenPrefetchRuntime:
                 max_tokens=self.local_total_cap,
             )
             if out_compact is not None:
-                out = out_compact.unsqueeze(1).contiguous()
+                return out_compact.unsqueeze(1).contiguous()
+            return None
+
+        is_a100 = bool(self._is_a100 or self._sm == 80)
+        if is_a100 and (not strict):
+            backend = self._a100_attn_backend
+            if backend == "flash_pkg":
+                out = _call_flash_attn_pkg()
+                if out is not None:
+                    if not self._a100_attn_backend_reported:
+                        self._a100_attn_backend_reported = True
+                        print(
+                            "[EchoKV] A100 attention backend locked: flash_attn_pkg "
+                            f"(sm={self._sm})"
+                        )
+                    if out.shape[0] == 1 and bsz > 1:
+                        out = out.expand(bsz, -1, -1, -1).contiguous()
+                    return out
+                self._a100_attn_backend = None
+            elif backend == "triton":
+                out = _call_triton_plain()
+                if out is not None:
+                    if not self._a100_attn_backend_reported:
+                        self._a100_attn_backend_reported = True
+                        print(
+                            "[EchoKV] A100 attention backend locked: triton_plain "
+                            f"(sm={self._sm})"
+                        )
+                    if out.shape[0] == 1 and bsz > 1:
+                        out = out.expand(bsz, -1, -1, -1).contiguous()
+                    return out
+                self._a100_attn_backend = None
+            elif backend == "sdpa":
+                return self.attend(q, local_k, local_v)
+
+            if prefer_pkg:
+                out = _call_flash_attn_pkg()
+                if out is not None:
+                    self._a100_attn_backend = "flash_pkg"
+            if out is None:
+                out = _call_triton_plain()
+                if out is not None:
+                    self._a100_attn_backend = "triton"
+            if out is None and self.use_a100_sdpa_attn:
+                self._a100_attn_backend = "sdpa"
+                if not self._a100_sdpa_attn_reported:
+                    self._a100_sdpa_attn_reported = True
+                    print(
+                        "[EchoKV] A100 SDPA attention fallback enabled: "
+                        f"sm={self._sm}, mid_pages={self.mid_pages}"
+                    )
+                return self.attend(q, local_k, local_v)
+            if out is not None:
+                if not self._a100_attn_backend_reported and self._a100_attn_backend is not None:
+                    self._a100_attn_backend_reported = True
+                    print(
+                        "[EchoKV] A100 attention backend locked: "
+                        f"{self._a100_attn_backend} (sm={self._sm})"
+                    )
+                if out.shape[0] == 1 and bsz > 1:
+                    out = out.expand(bsz, -1, -1, -1).contiguous()
+                return out
+
+        if prefer_pkg:
+            out = _call_flash_attn_pkg()
+
+        if out is None:
+            out = _call_triton_plain()
 
         if out is None and (not prefer_pkg):
             out = _call_flash_attn_pkg()
