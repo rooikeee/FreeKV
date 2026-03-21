@@ -209,6 +209,7 @@ class InferState:
         self.echo_a100_fast_prefetch = bool(
             kwargs.get("echo_a100_fast_prefetch", True)
         )
+        self.echo_lazy_cpu_copy = bool(kwargs.get("echo_lazy_cpu_copy", True))
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "flash_attn")).lower()
         self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "split_overlap")).lower()
@@ -341,6 +342,7 @@ class InferState:
                     stream_chunk_pages=self.echo_stream_chunk_pages,
                     stream_prefetch_only=self.echo_stream_prefetch_only,
                     a100_fast_prefetch=self.echo_a100_fast_prefetch,
+                    lazy_cpu_copy=self.echo_lazy_cpu_copy,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(
@@ -821,6 +823,12 @@ class InferState:
                 "Echo native decode requires flash_attn backend only"
             )
         cur_seq = rt.cpu_len
+        if rt.middle_bounds(cur_seq) is not None and rt.cpu_synced_len < cur_seq:
+            # Lazy CPU copy mode: backfill unsynced tail only when sparse recall
+            # path becomes active.
+            pack_sync_t0 = self._perf_start("pack")
+            rt._sync_cpu_from_dense(cur_seq)
+            self._perf_stop("pack", pack_sync_t0)
         starts = rt.build_starts(cur_seq)
         if starts is None and rt.anchors is None:
             # Short-prompt decode: bootstrap anchors only when middle bounds

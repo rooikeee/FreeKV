@@ -124,6 +124,8 @@ def parse_args(args=None):
                         help="Chunk size (pages) for stream-overlap QK->partial-recall path")
     parser.add_argument("--echo_disable_a100_fast_prefetch", action="store_true",
                         help="Disable A100-specific whole-middle prefetch path")
+    parser.add_argument("--echo_disable_lazy_cpu_copy", action="store_true",
+                        help="Disable lazy CPU KV copy before sparse-recall activation")
     parser.add_argument("--echo_disable_stream_prefetch_only", action="store_true",
                         help="Disable fast stream mode (selection-only + flash-attn output) and use score-cache split path")
     parser.add_argument("--echo_disable_native_only", action="store_true",
@@ -186,6 +188,7 @@ def load_model_and_tokenizer(path):
           f"flash_mode={args.echo_flash_mode}, "
           f"stream_chunk_pages={args.echo_stream_chunk_pages}, "
           f"a100_fast_prefetch={(not args.echo_disable_a100_fast_prefetch)}, "
+          f"lazy_cpu_copy={(not args.echo_disable_lazy_cpu_copy)}, "
           f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
           f"native_only={(not args.echo_disable_native_only)}, "
           f"triton_qk_select={(not args.echo_disable_triton_qk_select)}, "
@@ -218,6 +221,7 @@ def load_model_and_tokenizer(path):
             echo_flash_mode=args.echo_flash_mode,
             echo_stream_chunk_pages=args.echo_stream_chunk_pages,
             echo_a100_fast_prefetch=(not args.echo_disable_a100_fast_prefetch),
+            echo_lazy_cpu_copy=(not args.echo_disable_lazy_cpu_copy),
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
             echo_native_only=(not args.echo_disable_native_only),
             echo_shared_batch=args.echo_shared_batch,

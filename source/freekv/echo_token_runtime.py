@@ -854,6 +854,7 @@ class EchoTokenPrefetchRuntime:
         stream_prefetch_only: bool = True,
         prefetch_pack_buffers: bool = False,
         a100_fast_prefetch: bool = True,
+        lazy_cpu_copy: bool = True,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -877,6 +878,7 @@ class EchoTokenPrefetchRuntime:
         self.stream_prefetch_only = bool(stream_prefetch_only)
         self.prefetch_pack_buffers = bool(prefetch_pack_buffers)
         self.a100_fast_prefetch = bool(a100_fast_prefetch)
+        self.lazy_cpu_copy = bool(lazy_cpu_copy)
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -922,6 +924,7 @@ class EchoTokenPrefetchRuntime:
         self.dense_v = None
         self.dense_cap = 0
         self.dense_len = 0
+        self.cpu_synced_len = 0
         self.pending_idx = 0
         self.active_idx = 0
         self.pending_seq_len = -1
@@ -986,6 +989,27 @@ class EchoTokenPrefetchRuntime:
         self.dense_v = new_v
         self.dense_cap = cap
 
+    def _sync_cpu_from_dense(self, end_len: Optional[int] = None):
+        if end_len is None:
+            end_len = int(self.cpu_len)
+        end_len = int(end_len)
+        if end_len <= int(self.cpu_synced_len):
+            return
+        if end_len <= 0:
+            return
+        self._maybe_expand_cpu(end_len)
+        beg = int(self.cpu_synced_len)
+        if self.dense_k is None or self.dense_v is None or self.dense_len < end_len:
+            raise RuntimeError(
+                "Echo dense cache is not ready for CPU backfill: "
+                f"dense_len={self.dense_len}, required_end={end_len}"
+            )
+        k_src = self.dense_k[: self.eff_batch, :, beg:end_len].permute(0, 2, 1, 3)
+        v_src = self.dense_v[: self.eff_batch, :, beg:end_len].permute(0, 2, 1, 3)
+        self.cpu_kv[:, beg:end_len, 0].copy_(k_src, non_blocking=True)
+        self.cpu_kv[:, beg:end_len, 1].copy_(v_src, non_blocking=True)
+        self.cpu_synced_len = end_len
+
     def _effective_batch(self, bsz: int) -> int:
         if self.shared_batch and bsz > 1:
             return 1
@@ -1037,7 +1061,7 @@ class EchoTokenPrefetchRuntime:
         min_cap = self.sink_tokens + self.win_tokens + self.mid_tokens + 16
         self.cpu_capacity = max(2048, min_cap)
         self.cpu_kv = torch.empty(
-            (bsz, self.cpu_capacity, 2, self.n_kv_heads, self.head_dim),
+            (eff_bsz, self.cpu_capacity, 2, self.n_kv_heads, self.head_dim),
             dtype=dtype,
             device=torch.device("cpu"),
             pin_memory=True,
@@ -1107,6 +1131,7 @@ class EchoTokenPrefetchRuntime:
         self._head_idx = None
         self._a100_fast_reported = False
         self.dense_len = 0
+        self.cpu_synced_len = 0
 
     def bootstrap_anchors_from_cpu(self, q: torch.Tensor, seq_len: int) -> bool:
         # Used when prompt is short and middle bounds become valid only after
@@ -1169,7 +1194,7 @@ class EchoTokenPrefetchRuntime:
         while new_cap < needed_tokens:
             new_cap *= 2
         new_buf = torch.empty(
-            (self.batch_size, new_cap, 2, self.n_kv_heads, self.head_dim),
+            (self.eff_batch, new_cap, 2, self.n_kv_heads, self.head_dim),
             dtype=self.cpu_kv.dtype,
             device=torch.device("cpu"),
             pin_memory=True,
@@ -1182,17 +1207,24 @@ class EchoTokenPrefetchRuntime:
     def copy_prefill_to_cpu(self, k: torch.Tensor, v: torch.Tensor):
         # k/v: [bsz, q_len, n_kv_heads, head_dim]
         q_len = k.shape[1]
-        self._maybe_expand_cpu(q_len)
-        self.cpu_kv[:, :q_len, 0].copy_(k, non_blocking=True)
-        self.cpu_kv[:, :q_len, 1].copy_(v, non_blocking=True)
+        k_eff = k[: self.eff_batch]
+        v_eff = v[: self.eff_batch]
         self.cpu_len = q_len
         if q_len > 0:
             self._ensure_dense_gpu_buffers(q_len)
-            k_hsd = k[: self.eff_batch].transpose(1, 2)
-            v_hsd = v[: self.eff_batch].transpose(1, 2)
+            k_hsd = k_eff.transpose(1, 2)
+            v_hsd = v_eff.transpose(1, 2)
             self.dense_k[: self.eff_batch, :, :q_len].copy_(k_hsd, non_blocking=True)
             self.dense_v[: self.eff_batch, :, :q_len].copy_(v_hsd, non_blocking=True)
             self.dense_len = q_len
+        need_cpu_prefill = (not self.lazy_cpu_copy) or (self.middle_bounds(q_len) is not None)
+        if need_cpu_prefill and q_len > 0:
+            self._maybe_expand_cpu(q_len)
+            self.cpu_kv[:, :q_len, 0].copy_(k_eff, non_blocking=True)
+            self.cpu_kv[:, :q_len, 1].copy_(v_eff, non_blocking=True)
+            self.cpu_synced_len = q_len
+        else:
+            self.cpu_synced_len = 0
 
         self.sink_len = min(self.sink_tokens, q_len)
         self.win_len = min(self.win_tokens, q_len)
@@ -1200,17 +1232,17 @@ class EchoTokenPrefetchRuntime:
 
         if self.sink_tokens > 0:
             self.sink_k = torch.empty(
-                (self.batch_size, self.n_kv_heads, self.sink_tokens, self.head_dim),
-                dtype=k.dtype,
-                device=k.device,
+                (self.eff_batch, self.n_kv_heads, self.sink_tokens, self.head_dim),
+                dtype=k_eff.dtype,
+                device=k_eff.device,
             )
             self.sink_v = torch.empty_like(self.sink_k)
             if self.sink_len > 0:
                 self.sink_k[:, :, : self.sink_len].copy_(
-                    k[:, : self.sink_len].transpose(1, 2), non_blocking=True
+                    k_eff[:, : self.sink_len].transpose(1, 2), non_blocking=True
                 )
                 self.sink_v[:, :, : self.sink_len].copy_(
-                    v[:, : self.sink_len].transpose(1, 2), non_blocking=True
+                    v_eff[:, : self.sink_len].transpose(1, 2), non_blocking=True
                 )
         else:
             self.sink_k = None
@@ -1218,17 +1250,17 @@ class EchoTokenPrefetchRuntime:
 
         if self.win_tokens > 0:
             self.win_k = torch.empty(
-                (self.batch_size, self.n_kv_heads, self.win_tokens, self.head_dim),
-                dtype=k.dtype,
-                device=k.device,
+                (self.eff_batch, self.n_kv_heads, self.win_tokens, self.head_dim),
+                dtype=k_eff.dtype,
+                device=k_eff.device,
             )
             self.win_v = torch.empty_like(self.win_k)
             if self.win_len > 0:
                 self.win_k[:, :, : self.win_len].copy_(
-                    k[:, q_len - self.win_len : q_len].transpose(1, 2), non_blocking=True
+                    k_eff[:, q_len - self.win_len : q_len].transpose(1, 2), non_blocking=True
                 )
                 self.win_v[:, :, : self.win_len].copy_(
-                    v[:, q_len - self.win_len : q_len].transpose(1, 2), non_blocking=True
+                    v_eff[:, q_len - self.win_len : q_len].transpose(1, 2), non_blocking=True
                 )
         else:
             self.win_k = None
@@ -1247,25 +1279,40 @@ class EchoTokenPrefetchRuntime:
     ):
         # k_tok/v_tok: [bsz, 1, n_kv_heads, head_dim]
         needed = self.cpu_len + 1
-        self._maybe_expand_cpu(needed)
         if src_stream is None:
             src_stream = torch.cuda.current_stream(self.device)
-        self.append_event.record(src_stream)
-        with torch.cuda.stream(self.recall_stream):
-            self.recall_stream.wait_event(self.append_event)
-            self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 0].copy_(k_tok, non_blocking=True)
-            self.cpu_kv[:, self.cpu_len : self.cpu_len + 1, 1].copy_(v_tok, non_blocking=True)
+        k_tok_eff = k_tok[: self.eff_batch]
+        v_tok_eff = v_tok[: self.eff_batch]
         self.cpu_len = needed
         self._ensure_dense_gpu_buffers(self.cpu_len)
         dpos = self.cpu_len - 1
-        k_tok_eff = k_tok[: self.eff_batch, 0].unsqueeze(2)
-        v_tok_eff = v_tok[: self.eff_batch, 0].unsqueeze(2)
-        self.dense_k[: self.eff_batch, :, dpos : dpos + 1].copy_(k_tok_eff, non_blocking=True)
-        self.dense_v[: self.eff_batch, :, dpos : dpos + 1].copy_(v_tok_eff, non_blocking=True)
+        k_tok_dense = k_tok_eff[:, 0].unsqueeze(2)
+        v_tok_dense = v_tok_eff[:, 0].unsqueeze(2)
+        self.dense_k[: self.eff_batch, :, dpos : dpos + 1].copy_(k_tok_dense, non_blocking=True)
+        self.dense_v[: self.eff_batch, :, dpos : dpos + 1].copy_(v_tok_dense, non_blocking=True)
         if self.dense_len < self.cpu_len:
             self.dense_len = self.cpu_len
-        k_tok_h = k_tok.transpose(1, 2)
-        v_tok_h = v_tok.transpose(1, 2)
+
+        need_cpu_copy_now = True
+        if self.lazy_cpu_copy and self.middle_bounds(self.cpu_len) is None:
+            # Before sparse-recall region becomes valid, keep updates on GPU only.
+            need_cpu_copy_now = False
+
+        if need_cpu_copy_now:
+            self._sync_cpu_from_dense(self.cpu_len - 1)
+            self._maybe_expand_cpu(self.cpu_len)
+            self.append_event.record(src_stream)
+            with torch.cuda.stream(self.recall_stream):
+                self.recall_stream.wait_event(self.append_event)
+                self.cpu_kv[:, self.cpu_len - 1 : self.cpu_len, 0].copy_(
+                    k_tok_eff, non_blocking=True
+                )
+                self.cpu_kv[:, self.cpu_len - 1 : self.cpu_len, 1].copy_(
+                    v_tok_eff, non_blocking=True
+                )
+            self.cpu_synced_len = self.cpu_len
+        k_tok_h = k_tok_eff.transpose(1, 2)
+        v_tok_h = v_tok_eff.transpose(1, 2)
 
         if self.sink_tokens > 0:
             if self.sink_len < self.sink_tokens:
