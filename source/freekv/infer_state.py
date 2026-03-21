@@ -210,6 +210,10 @@ class InferState:
             kwargs.get("echo_a100_fast_prefetch", True)
         )
         self.echo_lazy_cpu_copy = bool(kwargs.get("echo_lazy_cpu_copy", True))
+        self.echo_reduce_host_sync = bool(kwargs.get("echo_reduce_host_sync", True))
+        self.echo_full_fast_pages_threshold = int(
+            kwargs.get("echo_full_fast_pages_threshold", 64)
+        )
         self.echo_anchor_head_sample = int(kwargs.get("echo_anchor_head_sample", 0))
         self.echo_attn_backend = str(kwargs.get("echo_attn_backend", "flash_attn")).lower()
         self.echo_flash_mode = str(kwargs.get("echo_flash_mode", "split_overlap")).lower()
@@ -343,6 +347,8 @@ class InferState:
                     stream_prefetch_only=self.echo_stream_prefetch_only,
                     a100_fast_prefetch=self.echo_a100_fast_prefetch,
                     lazy_cpu_copy=self.echo_lazy_cpu_copy,
+                    reduce_host_sync=self.echo_reduce_host_sync,
+                    full_fast_pages_threshold=self.echo_full_fast_pages_threshold,
                 )
             if self.echo_attn_backend == "flashinfer":
                 local_pages_set = sorted(

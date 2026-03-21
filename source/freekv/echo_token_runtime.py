@@ -855,6 +855,8 @@ class EchoTokenPrefetchRuntime:
         prefetch_pack_buffers: bool = False,
         a100_fast_prefetch: bool = True,
         lazy_cpu_copy: bool = True,
+        reduce_host_sync: bool = True,
+        full_fast_pages_threshold: int = 64,
     ) -> None:
         self.n_qo_heads = n_qo_heads
         self.n_kv_heads = n_kv_heads
@@ -879,6 +881,8 @@ class EchoTokenPrefetchRuntime:
         self.prefetch_pack_buffers = bool(prefetch_pack_buffers)
         self.a100_fast_prefetch = bool(a100_fast_prefetch)
         self.lazy_cpu_copy = bool(lazy_cpu_copy)
+        self.reduce_host_sync = bool(reduce_host_sync)
+        self.full_fast_pages_threshold = int(max(1, full_fast_pages_threshold))
         self.n_q_per_kv = self.n_qo_heads // self.n_kv_heads
         self._inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
         self.delta_max_pages = 8
@@ -2375,7 +2379,12 @@ class EchoTokenPrefetchRuntime:
         has_linear_partial = hasattr(kernels, "recall_tokens_linear_partial")
         has_delta_full = hasattr(kernels, "recall_tokens_delta_linear")
         has_linear_full = hasattr(kernels, "recall_tokens_linear")
-        if (not has_delta_partial) and (not has_linear_partial):
+        if (
+            (not has_delta_partial)
+            and (not has_linear_partial)
+            and (not has_delta_full)
+            and (not has_linear_full)
+        ):
             return False
 
         has_cuda_pagemax_only_reduced = hasattr(
@@ -2402,37 +2411,48 @@ class EchoTokenPrefetchRuntime:
         if max_start < lower:
             return False
 
-        starts_full = self.active_starts.to(
-            device=torch.device("cpu"), dtype=torch.int32
-        ).clone()
-        local_best_full = torch.empty(
-            (eff, self.mid_pages), dtype=torch.int32, device=torch.device("cpu")
-        )
+        active_starts_cpu = self.active_starts
+        if (
+            active_starts_cpu.device.type != "cpu"
+            or active_starts_cpu.dtype != torch.int32
+            or (not active_starts_cpu.is_contiguous())
+        ):
+            active_starts_cpu = active_starts_cpu.to(
+                device=torch.device("cpu"), dtype=torch.int32
+            ).contiguous()
+        starts_full = active_starts_cpu.clone()
 
         pending_idx = self.active_idx if allow_inplace_delta else (1 - self.active_idx)
         out_buf = self.gpu_mid[pending_idx]
         starts_dev = starts_full
-        prev_starts_dev = self.active_starts
+        prev_starts_dev = active_starts_cpu
 
         cur_stream = torch.cuda.current_stream(self.device)
         self.recall_stream.wait_stream(cur_stream)
 
         chunk_pages = int(max(1, min(self.stream_chunk_pages, self.mid_pages)))
         use_a100_full_fast = bool(
-            self.a100_fast_prefetch
-            and (self._is_a100 or self._sm == 80)
-            and (has_cuda_pagemax_only_reduced or has_cuda_pagemax_only)
-            and (has_delta_full or has_linear_full)
+            self.a100_fast_prefetch and (self._is_a100 or self._sm == 80)
         )
-        if use_a100_full_fast and (not self._a100_fast_reported):
+        use_hostsync_reduced_full = bool(
+            self.reduce_host_sync
+            and self.mid_pages <= int(self.full_fast_pages_threshold)
+        )
+        use_full_fast = bool(
+            (has_cuda_pagemax_only_reduced or has_cuda_pagemax_only)
+            and (has_delta_full or has_linear_full)
+            and (use_a100_full_fast or use_hostsync_reduced_full)
+        )
+        if use_full_fast and (not self._a100_fast_reported):
             self._a100_fast_reported = True
+            fast_mode = "A100" if use_a100_full_fast else "host-sync-reduced"
             print(
-                "[EchoKV] A100 fast prefetch enabled: "
+                f"[EchoKV] {fast_mode} full prefetch enabled: "
                 f"sm={self._sm}, mid_pages={self.mid_pages}, "
                 f"chunk_pages={chunk_pages} (bypassed)"
             )
         with torch.cuda.stream(self.recall_stream):
-            if use_a100_full_fast:
+            if use_full_fast:
                 local_best_all = None
                 if has_cuda_pagemax_only_reduced:
                     local_best_all = kernels.echo_decode_qk_pagemax_chunk_only_reduced(
@@ -2460,10 +2480,9 @@ class EchoTokenPrefetchRuntime:
                 local_best_cpu = local_best_all.to(
                     device=torch.device("cpu"), dtype=torch.int32
                 )
-                local_best_full.copy_(local_best_cpu, non_blocking=False)
                 starts_full.copy_(
                     torch.clamp(
-                        self.active_starts + local_best_cpu - int(self.slide_half_window),
+                        active_starts_cpu + local_best_cpu - int(self.slide_half_window),
                         min=lower,
                         max=max_start,
                     ).to(dtype=torch.int32),
@@ -2471,12 +2490,13 @@ class EchoTokenPrefetchRuntime:
                 )
                 # A100 path: sort starts to improve contiguous run detection in
                 # recall memcpy scheduling (attention is permutation-invariant).
-                starts_full.copy_(
-                    torch.sort(starts_full, dim=-1).values.to(
-                        device=torch.device("cpu"), dtype=torch.int32
-                    ),
-                    non_blocking=False,
-                )
+                if use_a100_full_fast:
+                    starts_full.copy_(
+                        torch.sort(starts_full, dim=-1).values.to(
+                            device=torch.device("cpu"), dtype=torch.int32
+                        ),
+                        non_blocking=False,
+                    )
                 if has_delta_full and self.active_starts is not None:
                     kernels.recall_tokens_delta_linear(
                         starts_dev,
@@ -2494,7 +2514,7 @@ class EchoTokenPrefetchRuntime:
                         self.cpu_len,
                     )
                 else:
-                    # Should not happen due to use_a100_full_fast guard.
+                    # Should not happen due to use_full_fast guard.
                     self._fallback_recall(starts_dev, out_buf)
             else:
                 for p0 in range(0, self.mid_pages, chunk_pages):
@@ -2549,9 +2569,8 @@ class EchoTokenPrefetchRuntime:
                     local_best_chunk_cpu = local_best_chunk.to(
                         device=torch.device("cpu"), dtype=torch.int32
                     )
-                    local_best_full[:, p0 : p0 + p_count].copy_(local_best_chunk_cpu)
 
-                    starts_chunk = self.active_starts[:, p0 : p0 + p_count] + local_best_chunk_cpu
+                    starts_chunk = active_starts_cpu[:, p0 : p0 + p_count] + local_best_chunk_cpu
                     starts_chunk = torch.clamp(
                         starts_chunk - int(self.slide_half_window),
                         min=lower,
@@ -2582,15 +2601,9 @@ class EchoTokenPrefetchRuntime:
                     else:
                         self._fallback_recall_partial(starts_dev, out_buf, p0, p_count)
 
-            if use_a100_full_fast:
-                # Keep anchors aligned with the sorted pending starts.
-                anchors = (starts_full + int(self.slide_half_window)).to(
-                    device=torch.device("cpu"), dtype=torch.int32
-                ).contiguous()
-            else:
-                anchors = (self.active_starts + local_best_full).to(
-                    device=torch.device("cpu"), dtype=torch.int32
-                ).contiguous()
+            anchors = (starts_full + int(self.slide_half_window)).to(
+                device=torch.device("cpu"), dtype=torch.int32
+            ).contiguous()
             self.anchors = anchors
             self._set_prefetch_hint(starts_full, int(target_seq_len))
 

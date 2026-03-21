@@ -124,6 +124,10 @@ def parse_args(args=None):
                         help="Chunk size (pages) for stream-overlap QK->partial-recall path")
     parser.add_argument("--echo_disable_a100_fast_prefetch", action="store_true",
                         help="Disable A100-specific whole-middle prefetch path")
+    parser.add_argument("--echo_disable_reduce_host_sync", action="store_true",
+                        help="Disable host-sync-reduced full-prefetch heuristic on non-A100 GPUs")
+    parser.add_argument("--echo_full_fast_pages_threshold", type=int, default=64,
+                        help="Enable full-prefetch path when mid_pages <= threshold")
     parser.add_argument("--echo_disable_lazy_cpu_copy", action="store_true",
                         help="Disable lazy CPU KV copy before sparse-recall activation")
     parser.add_argument("--echo_disable_stream_prefetch_only", action="store_true",
@@ -188,6 +192,8 @@ def load_model_and_tokenizer(path):
           f"flash_mode={args.echo_flash_mode}, "
           f"stream_chunk_pages={args.echo_stream_chunk_pages}, "
           f"a100_fast_prefetch={(not args.echo_disable_a100_fast_prefetch)}, "
+          f"reduce_host_sync={(not args.echo_disable_reduce_host_sync)}, "
+          f"full_fast_pages_threshold={args.echo_full_fast_pages_threshold}, "
           f"lazy_cpu_copy={(not args.echo_disable_lazy_cpu_copy)}, "
           f"stream_prefetch_only={(not args.echo_disable_stream_prefetch_only)}, "
           f"native_only={(not args.echo_disable_native_only)}, "
@@ -221,6 +227,8 @@ def load_model_and_tokenizer(path):
             echo_flash_mode=args.echo_flash_mode,
             echo_stream_chunk_pages=args.echo_stream_chunk_pages,
             echo_a100_fast_prefetch=(not args.echo_disable_a100_fast_prefetch),
+            echo_reduce_host_sync=(not args.echo_disable_reduce_host_sync),
+            echo_full_fast_pages_threshold=args.echo_full_fast_pages_threshold,
             echo_lazy_cpu_copy=(not args.echo_disable_lazy_cpu_copy),
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
             echo_native_only=(not args.echo_disable_native_only),
