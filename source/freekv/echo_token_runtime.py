@@ -1202,10 +1202,6 @@ class EchoTokenPrefetchRuntime:
                 and (not self._a100_triton_recall_reported)
             ):
                 self._a100_triton_recall_reported = True
-                print(
-                    "[EchoKV] A100 Triton recall enabled: "
-                    f"sm={self._sm}, mid_pages={self.mid_pages}"
-                )
 
         if self.recall_stream is None:
             self.recall_stream = torch.cuda.Stream(device)
@@ -1303,10 +1299,6 @@ class EchoTokenPrefetchRuntime:
         )
         if enabled and (not self._a100_cuda_chunk_attn_reported):
             self._a100_cuda_chunk_attn_reported = True
-            print(
-                "[EchoKV] A100 CUDA chunk-attn mode enabled: "
-                "qk_chunk->anchor->recall(overlap)->pv"
-            )
         return enabled
 
     def can_use_gpu_dense_recall(self) -> bool:
@@ -3015,12 +3007,6 @@ class EchoTokenPrefetchRuntime:
         )
         if use_full_fast and (not self._a100_fast_reported):
             self._a100_fast_reported = True
-            fast_mode = "A100" if use_a100_full_fast else "host-sync-reduced"
-            print(
-                f"[EchoKV] {fast_mode} full prefetch enabled: "
-                f"sm={self._sm}, mid_pages={self.mid_pages}, "
-                f"chunk_pages={chunk_pages} (bypassed)"
-            )
         with torch.cuda.stream(self.recall_stream):
             if use_full_fast:
                 local_best_all = None
@@ -3507,10 +3493,6 @@ class EchoTokenPrefetchRuntime:
                 if out is not None:
                     if not self._a100_attn_backend_reported:
                         self._a100_attn_backend_reported = True
-                        print(
-                            "[EchoKV] A100 attention backend locked: flash_attn_pkg "
-                            f"(sm={self._sm})"
-                        )
                     if out.shape[0] == 1 and bsz > 1:
                         out = out.expand(bsz, -1, -1, -1).contiguous()
                     return out
@@ -3520,10 +3502,6 @@ class EchoTokenPrefetchRuntime:
                 if out is not None:
                     if not self._a100_attn_backend_reported:
                         self._a100_attn_backend_reported = True
-                        print(
-                            "[EchoKV] A100 attention backend locked: triton_plain "
-                            f"(sm={self._sm})"
-                        )
                     if out.shape[0] == 1 and bsz > 1:
                         out = out.expand(bsz, -1, -1, -1).contiguous()
                     return out
@@ -3543,18 +3521,10 @@ class EchoTokenPrefetchRuntime:
                 self._a100_attn_backend = "sdpa"
                 if not self._a100_sdpa_attn_reported:
                     self._a100_sdpa_attn_reported = True
-                    print(
-                        "[EchoKV] A100 SDPA attention fallback enabled: "
-                        f"sm={self._sm}, mid_pages={self.mid_pages}"
-                    )
                 return self.attend(q, local_k, local_v)
             if out is not None:
                 if not self._a100_attn_backend_reported and self._a100_attn_backend is not None:
                     self._a100_attn_backend_reported = True
-                    print(
-                        "[EchoKV] A100 attention backend locked: "
-                        f"{self._a100_attn_backend} (sm={self._sm})"
-                    )
                 if out.shape[0] == 1 and bsz > 1:
                     out = out.expand(bsz, -1, -1, -1).contiguous()
                 return out

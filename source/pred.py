@@ -6,6 +6,7 @@ import json, os, argparse, random
 from datasets import load_dataset
 import numpy as np
 import time
+from datetime import datetime
 
 c = torch.cuda.get_device_capability()
 os.environ["TORCH_CUDA_ARCH_LIST"] = f"{c[0]}.{c[1]}"
@@ -84,6 +85,18 @@ def simplify_text_preview(text, max_tokens=100):
     return " ".join(tokens[:max_tokens])
 
 
+def target_gen_len_for_task(task_name: str):
+    if task_name == "gov_report":
+        return 512
+    if task_name == "lgbench":
+        return 16384
+    return None
+
+
+def result_impl_name(sel_policy: str):
+    return "echokv" if sel_policy == "echokv_token" else "freekv"
+
+
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
@@ -138,6 +151,8 @@ def parse_args(args=None):
                         help="Allow legacy fallback paths for echokv_token (slower; debug only)")
     parser.add_argument("--echo_disable_fullkv_first_layer", action="store_true",
                         help="Disable speed mode that keeps layer-0 KV fully on GPU (no CPU offload/recall)")
+    parser.add_argument("--echo_multi_batch_turbo_threshold", type=int, default=2,
+                        help="Auto trigger multi-batch turbo mode when repeat_bsz > threshold")
     parser.add_argument("--echo_attn_backend", type=str, default="flash_attn",
                         choices=["sdpa", "flashinfer", "flash_attn"],
                         help="Attention backend for EchoKV-token decode")
@@ -199,6 +214,15 @@ def load_model_and_tokenizer(path):
     use_triton_recall_a100 = bool(
         args.echo_enable_triton_recall_a100 and (not args.echo_disable_triton_recall_a100)
     )
+    requested_fullkv_first_layer = bool(not args.echo_disable_fullkv_first_layer)
+    multi_batch_turbo = bool(
+        args.sel_policy == "echokv_token"
+        and (not args.echo_disable_native_only)
+        and int(args.repeat_bsz) > int(args.echo_multi_batch_turbo_threshold)
+    )
+    enable_fullkv_first_layer = bool(
+        requested_fullkv_first_layer and (not multi_batch_turbo)
+    )
     use_a100_sdpa_attn = bool(not args.echo_disable_a100_sdpa_attn)
     use_cuda_chunk_attn_a100 = bool(not args.echo_disable_cuda_chunk_attn_a100)
     print(f"\n{CYAN}{SEP}")
@@ -222,17 +246,25 @@ def load_model_and_tokenizer(path):
             f"triton_flash_attn={(not args.echo_disable_triton_flash_attn)}, "
            f"triton_recall_a100={use_triton_recall_a100}, "
            f"a100_sdpa_attn={use_a100_sdpa_attn}, "
-           f"cuda_chunk_attn_a100={use_cuda_chunk_attn_a100}, "
-           f"triton_flash_strict={(not args.echo_allow_flash_fallback)}, "
-           f"fullkv_first_layer={(not args.echo_disable_fullkv_first_layer)}")
+            f"cuda_chunk_attn_a100={use_cuda_chunk_attn_a100}, "
+            f"triton_flash_strict={(not args.echo_allow_flash_fallback)}, "
+           f"fullkv_first_layer={enable_fullkv_first_layer}, "
+           f"multi_batch_turbo={multi_batch_turbo}, "
+           f"turbo_threshold={args.echo_multi_batch_turbo_threshold}")
     print(f"{SEP}{RESET}\n")
+    if multi_batch_turbo:
+        print(
+            f"{YELLOW}[EchoKV] multi-batch turbo enabled: repeat_bsz={args.repeat_bsz} "
+            f"> {args.echo_multi_batch_turbo_threshold}, "
+            f"disable layer-0 fullkv for higher multi-batch throughput.{RESET}"
+        )
     if token_budgets > 0:
         page_budgets_cfg = page_budgets
         page_topks_cfg = page_budgets - 1
         if (
             args.sel_policy == "echokv_token"
             and (not args.echo_disable_native_only)
-            and (not args.echo_disable_fullkv_first_layer)
+            and enable_fullkv_first_layer
         ):
             n_layers = int(model.config.num_hidden_layers)
             page_budgets_cfg = [None] + [page_budgets] * max(0, n_layers - 1)
@@ -268,7 +300,7 @@ def load_model_and_tokenizer(path):
             echo_stream_prefetch_only=(not args.echo_disable_stream_prefetch_only),
             echo_prefetch_pack_buffers=(not args.echo_disable_prefetch_pack_buffers),
             echo_native_only=(not args.echo_disable_native_only),
-            echo_fullkv_first_layer=(not args.echo_disable_fullkv_first_layer),
+            echo_fullkv_first_layer=enable_fullkv_first_layer,
             echo_shared_batch=args.echo_shared_batch,
             echo_shared_decode_full_model=(
                 not args.echo_disable_shared_decode_full_model
@@ -312,8 +344,12 @@ def get_pred(
     temperature,
     warmup,
     expand_prompt_to_max_length,
+    task_name,
+    impl_name,
 ):
     preds = []
+    timing_records = []
+    target_gen_len = target_gen_len_for_task(task_name)
     for json_obj in tqdm(data):
         prep_t0 = time.perf_counter()
         if prompt_format is not None:
@@ -378,6 +414,21 @@ def get_pred(
         attn_ms = perf["attn_ms"]
         pack_ms = perf.get("pack_ms", 0.0)
         wait_ms = perf.get("wait_ms", 0.0)
+        gen_len_steps = int(len(decode_ms))
+        if gen_len_steps <= 0:
+            gen_len_steps = int(max(gen_token) if len(gen_token) > 0 else 0)
+        norm_prefill_ms = float(prefill_ms)
+        norm_decode_ms = float(decode_total_ms)
+        norm_total_ms = float(norm_prefill_ms + norm_decode_ms)
+        norm_applied = False
+        if (
+            target_gen_len is not None
+            and gen_len_steps > 0
+            and gen_len_steps < int(target_gen_len)
+        ):
+            norm_decode_ms = float(decode_total_ms) * float(target_gen_len) / float(gen_len_steps)
+            norm_total_ms = float(prefill_ms) + norm_decode_ms
+            norm_applied = True
         other_decode_ms = max(
             0.0, decode_total_ms - select_ms - recall_ms - attn_ms - pack_ms - wait_ms
         )
@@ -396,7 +447,34 @@ def get_pred(
         print(f"  Assemble time    : {pack_ms/1000:.2f}s ({perf.get('pack_calls', 0)} calls)")
         print(f"  Decode attn time : {attn_ms/1000:.2f}s ({perf['attn_calls']} calls)")
         print(f"  Decode other     : {other_decode_ms/1000:.2f}s")
+        if norm_applied:
+            print(
+                f"  Normalized({target_gen_len}) total/decode/prefill: "
+                f"{norm_total_ms/1000:.2f}s / {norm_decode_ms/1000:.2f}s / {norm_prefill_ms/1000:.2f}s"
+            )
         print(f"{GREEN}{SEP}{RESET}\n")
+
+        timing_records.append(
+            {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "model": model_name,
+                "task": task_name,
+                "impl": impl_name,
+                "input_len": int(prompt_length),
+                "gen_len": int(gen_len_steps),
+                "target_gen_len": int(target_gen_len) if target_gen_len is not None else None,
+                "normalized": bool(norm_applied),
+                "total_time": float(norm_total_ms / 1000.0),
+                "decode_time": float(norm_decode_ms / 1000.0),
+                "prefill_time": float(norm_prefill_ms / 1000.0),
+                "raw_total_time": float((prefill_ms + decode_total_ms) / 1000.0),
+                "raw_decode_time": float(decode_total_ms / 1000.0),
+                "raw_prefill_time": float(prefill_ms / 1000.0),
+                "time_unit": "s",
+                "repeat_bsz": int(args.repeat_bsz),
+            }
+        )
+
         for b in range(len(output)):
             pred = tokenizer.decode(output[b], skip_special_tokens=True)
             pred_only_output = tokenizer.decode(output[b][len(input[b]):], skip_special_tokens=True)
@@ -410,7 +488,7 @@ def get_pred(
                     "output_len": len(output[b]),
                 }
             )
-    return preds
+    return preds, timing_records
 
 
 if __name__ == "__main__":
@@ -476,7 +554,8 @@ if __name__ == "__main__":
         data = data.select(range(args.data_idx, args.data_idx+1))
     elif args.data_idx_to is not None:
         data = data.select(range(0, args.data_idx_to))
-    preds = get_pred(
+    impl_name = result_impl_name(args.sel_policy)
+    preds, timing_records = get_pred(
         model,
         tokenizer,
         eos_token_ids,
@@ -490,6 +569,8 @@ if __name__ == "__main__":
         args.temperature,
         args.warmup,
         args.expand_prompt_to_max_length,
+        dataset,
+        impl_name,
     )
 
     out_dir = f"tmp_res/{model_name}"
@@ -500,6 +581,17 @@ if __name__ == "__main__":
         for pred in preds:
             json.dump(pred, f, ensure_ascii=False)
             f.write("\n")
+
+    timing_dir = os.path.join("tmp_res", model_name, dataset, impl_name)
+    os.makedirs(timing_dir, exist_ok=True)
+    timing_path = os.path.join(timing_dir, "timing.jsonl")
+    with open(timing_path, "a", encoding="utf-8") as f:
+        for rec in timing_records:
+            json.dump(rec, f, ensure_ascii=False)
+            f.write("\n")
+    print(
+        f"{CYAN}[Timing] appended {len(timing_records)} record(s) to {timing_path}{RESET}"
+    )
 
 
 # Original ArkVale
