@@ -89,10 +89,10 @@ def run_one_case(
     model,
     tokenizer,
     step_updater,
-    eos_token_ids,
-    max_new_tokens: int,
-) -> dict:
+    decode_tokens: int,
+) -> Tuple[dict, int]:
     input_ids = build_input_ids(prompt, model_name, tokenizer)
+    decode_steps = 0
     with torch.no_grad():
         if step_updater is not None:
             step_updater.reset(input_ids)
@@ -103,9 +103,7 @@ def run_one_case(
         )
         past_key_values = output.past_key_values
         pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-        if step_updater is not None:
-            step_updater.update(pred_token_idx.item())
-        for _ in range(max_new_tokens - 1):
+        for _ in range(decode_tokens):
             output = model(
                 input_ids=pred_token_idx,
                 past_key_values=past_key_values,
@@ -115,18 +113,18 @@ def run_one_case(
             pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
             if step_updater is not None:
                 step_updater.update(pred_token_idx.item())
-            if pred_token_idx.item() in eos_token_ids:
-                break
+            decode_steps += 1
     if step_updater is None:
-        return {}
-    return step_updater.finish()
+        return {}, decode_steps
+    return step_updater.finish(), decode_steps
 
 
 def main():
     parser = argparse.ArgumentParser()
     parse_common_args(parser)
     parser.add_argument("--lengths", type=str, default="8192,12288,16384,20480,24576,28672,32768")
-    parser.add_argument("--max_new_tokens", type=int, default=32)
+    parser.add_argument("--measure_decode_tokens", type=int, default=1)
+    parser.add_argument("--estimate_total_tokens", type=int, default=128)
     parser.add_argument("--save_path", type=str, default="eval/LongBench2/results/quest_timing_stats.json")
     args = parser.parse_args()
 
@@ -141,7 +139,7 @@ def main():
         raise ValueError("No valid target lengths.")
 
     model_name = args.model
-    model, tokenizer, step_updater, eos_token_ids, _ = load_model_and_tokenizer(
+    model, tokenizer, step_updater, _, _ = load_model_and_tokenizer(
         model_map[model_name], args
     )
 
@@ -168,8 +166,7 @@ def main():
         model,
         tokenizer,
         step_updater,
-        eos_token_ids,
-        max_new_tokens=1,
+        decode_tokens=max(1, args.measure_decode_tokens),
     )
 
     rows = []
@@ -178,23 +175,41 @@ def main():
             item, target_len, model_name, tokenizer
         )
         prompt = build_prompt(item, context)
-        stats = run_one_case(
+        stats, decode_steps = run_one_case(
             prompt,
             model_name,
             model,
             tokenizer,
             step_updater,
-            eos_token_ids,
-            args.max_new_tokens,
+            decode_tokens=max(1, args.measure_decode_tokens),
         )
-        token_select_ms = float(stats.get("token_select_ms", 0.0))
-        attn_compute_ms = float(stats.get("attn_compute_ms", 0.0))
-        ratio = (token_select_ms / attn_compute_ms) if attn_compute_ms > 0 else None
+        token_select_ms_total = float(stats.get("token_select_ms", 0.0))
+        attn_compute_ms_total = float(stats.get("attn_compute_ms", 0.0))
+        if decode_steps <= 0:
+            token_select_ms_per_token = 0.0
+            attn_compute_ms_per_token = 0.0
+        else:
+            token_select_ms_per_token = token_select_ms_total / float(decode_steps)
+            attn_compute_ms_per_token = attn_compute_ms_total / float(decode_steps)
+
+        est_select_ms = token_select_ms_per_token * float(args.estimate_total_tokens)
+        est_attn_ms = attn_compute_ms_per_token * float(args.estimate_total_tokens)
+        ratio = (
+            token_select_ms_per_token / attn_compute_ms_per_token
+            if attn_compute_ms_per_token > 0
+            else None
+        )
         row = {
             "target_input_len": int(target_len),
             "actual_input_len": int(actual_input_len),
-            "token_select_ms": token_select_ms,
-            "attn_compute_ms": attn_compute_ms,
+            "decode_tokens_measured": int(decode_steps),
+            "token_select_ms_total_measured": token_select_ms_total,
+            "attn_compute_ms_total_measured": attn_compute_ms_total,
+            "token_select_ms_per_token": token_select_ms_per_token,
+            "attn_compute_ms_per_token": attn_compute_ms_per_token,
+            "token_select_ms_est_total": est_select_ms,
+            "attn_compute_ms_est_total": est_attn_ms,
+            "estimate_total_tokens": int(args.estimate_total_tokens),
             "select_calls": int(stats.get("token_select_calls", 0)),
             "attn_calls": int(stats.get("attn_compute_calls", 0)),
             "select_over_attn_ratio": ratio,
@@ -203,8 +218,10 @@ def main():
         ratio_text = f"{ratio:.3f}" if ratio is not None else "NA"
         print(
             f"len={row['actual_input_len']}, "
-            f"select_ms={row['token_select_ms']:.3f}, "
-            f"attn_ms={row['attn_compute_ms']:.3f}, "
+            f"select_per_token_ms={row['token_select_ms_per_token']:.3f}, "
+            f"attn_per_token_ms={row['attn_compute_ms_per_token']:.3f}, "
+            f"select_x{args.estimate_total_tokens}={row['token_select_ms_est_total']:.3f}, "
+            f"attn_x{args.estimate_total_tokens}={row['attn_compute_ms_est_total']:.3f}, "
             f"ratio={ratio_text}"
         )
 
