@@ -367,53 +367,46 @@ def llama_dyn_attention_forward(
             self.v_zero_streaming = torch.cat([self.v_zero_streaming, v_zero_streaming], dim=1)
 
     if streaming_key_states.shape[1] > self.recent_size + self.sink_size:
-        recent_key_states = streaming_key_states[:, -self.recent_size :, :, :].clone()
-        streaming_key_states[
-            :, self.sink_size : self.sink_size + self.recent_size, :, :
-        ].copy_(recent_key_states)
-        streaming_key_states = streaming_key_states[
-            :, : self.sink_size + self.recent_size, :, :
-        ]
+        keep_len = self.sink_size + self.recent_size
+        if self.recent_size > 0:
+            recent_key_states = streaming_key_states[:, -self.recent_size :, :, :].clone()
+            streaming_key_states[
+                :, self.sink_size : self.sink_size + self.recent_size, :, :
+            ].copy_(recent_key_states)
 
-        recent_value_states = streaming_value_states[
-            :, -self.recent_size :, :, :
-        ].clone()
-        streaming_value_states[
-            :, self.sink_size : self.sink_size + self.recent_size, :, :
-        ].copy_(recent_value_states)
-        streaming_value_states = streaming_value_states[
-            :, : self.sink_size + self.recent_size, :, :
-        ]
+            recent_value_states = streaming_value_states[
+                :, -self.recent_size :, :, :
+            ].clone()
+            streaming_value_states[
+                :, self.sink_size : self.sink_size + self.recent_size, :, :
+            ].copy_(recent_value_states)
+
+            if self.kv8:
+                recent_k_scale = self.k_scale_streaming[:, -self.recent_size :, ...].clone()
+                self.k_scale_streaming[
+                    :, self.sink_size : self.sink_size + self.recent_size, :, :
+                ].copy_(recent_k_scale)
+                recent_k_zero = self.k_zero_streaming[:, -self.recent_size :, ...].clone()
+                self.k_zero_streaming[
+                    :, self.sink_size : self.sink_size + self.recent_size, :, :
+                ].copy_(recent_k_zero)
+
+                recent_v_scale = self.v_scale_streaming[:, -self.recent_size :, ...].clone()
+                self.v_scale_streaming[
+                    :, self.sink_size : self.sink_size + self.recent_size, :, :
+                ].copy_(recent_v_scale)
+                recent_v_zero = self.v_zero_streaming[:, -self.recent_size :, ...].clone()
+                self.v_zero_streaming[
+                    :, self.sink_size : self.sink_size + self.recent_size, :, :
+                ].copy_(recent_v_zero)
+
+        streaming_key_states = streaming_key_states[:, :keep_len, :, :]
+        streaming_value_states = streaming_value_states[:, :keep_len, :, :]
         if self.kv8:
-            recent_k_scale = self.k_scale_streaming[:, -self.recent_size :, ...].clone()
-            self.k_scale_streaming[
-                :, self.sink_size : self.sink_size + self.recent_size, :, :
-            ].copy_(recent_k_scale)
-            self.k_scale_streaming = self.k_scale_streaming[
-                :, : self.sink_size + self.recent_size, :, :
-            ]
-            recent_k_zero = self.k_zero_streaming[:, -self.recent_size :, ...].clone()
-            self.k_zero_streaming[
-                :, self.sink_size : self.sink_size + self.recent_size, :, :
-            ].copy_(recent_k_zero)
-            self.k_zero_streaming = self.k_zero_streaming[
-                :, : self.sink_size + self.recent_size, :, :
-            ]
-
-            recent_v_scale = self.v_scale_streaming[:, -self.recent_size :, ...].clone()
-            self.v_scale_streaming[
-                :, self.sink_size : self.sink_size + self.recent_size, :, :
-            ].copy_(recent_v_scale)
-            self.v_scale_streaming = self.v_scale_streaming[
-                :, : self.sink_size + self.recent_size, :, :
-            ]
-            recent_v_zero = self.v_zero_streaming[:, -self.recent_size :, ...].clone()
-            self.v_zero_streaming[
-                :, self.sink_size : self.sink_size + self.recent_size, :, :
-            ].copy_(recent_v_zero)
-            self.v_zero_streaming = self.v_zero_streaming[
-                :, : self.sink_size + self.recent_size, :, :
-            ]
+            self.k_scale_streaming = self.k_scale_streaming[:, :keep_len, :, :]
+            self.k_zero_streaming = self.k_zero_streaming[:, :keep_len, :, :]
+            self.v_scale_streaming = self.v_scale_streaming[:, :keep_len, :, :]
+            self.v_zero_streaming = self.v_zero_streaming[:, :keep_len, :, :]
     
     # if self.layer_idx == 10:
     #     print(f"{streaming_key_states.shape=}, {self.k_scale_streaming.shape=}, {self.k_zero_streaming.shape=}")
