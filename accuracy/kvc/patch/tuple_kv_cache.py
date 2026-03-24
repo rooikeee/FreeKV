@@ -1,18 +1,18 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 
 import torch
 import torch.nn.functional as F
+from torch.nn import CrossEntropyLoss
 
 from transformers.models.llama.modeling_llama import (
     LlamaForCausalLM,
-    CausalLMOutputWithPast,
-    List,
-    Union,
-    CrossEntropyLoss,
-    BaseModelOutputWithPast,
     apply_rotary_pos_emb,
 )
 from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+from transformers.modeling_outputs import (
+    CausalLMOutputWithPast,
+    BaseModelOutputWithPast,
+)
 import types
 import os
 try:
@@ -21,8 +21,17 @@ try:
     from .flashinfer_utils import apply_rope_inplace, enable_flashinfer_rmsnorm
     use_npu = False
 except ImportError:
-    import torch_npu
-    use_npu = True
+    flash_attn_varlen_func = None
+    index_first_axis = None
+    pad_input = None
+    unpad_input = None
+    apply_rope_inplace = None
+    enable_flashinfer_rmsnorm = None
+    try:
+        import torch_npu  # type: ignore  # noqa: F401
+        use_npu = True
+    except ImportError:
+        use_npu = False
 from .utils import flash_attn_maybe_npu, asym_quant_int8, asym_dequant_int8
 
 
@@ -79,7 +88,7 @@ def old_flash_attention_2_forward(
     if past_key_value is not None:
         kv_seq_len += past_key_value[0].shape[1]
 
-    if os.getenv("INPLACE_ROPE_OFF") is not None:
+    if os.getenv("INPLACE_ROPE_OFF") is not None or apply_rope_inplace is None:
         # temp fix for multi-GPU ...
         cos, sin = position_embeddings
         cos = cos.to(query_states.device)
@@ -177,7 +186,7 @@ def _flash_attention_forward(
             The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
     """
     # Contains at least one padding token in the sequence
-    if padding_mask is not None:
+    if padding_mask is not None and flash_attn_varlen_func is not None:
         batch_size = query_states.shape[0]
         (
             query_states,

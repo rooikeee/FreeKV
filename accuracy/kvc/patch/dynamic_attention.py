@@ -14,6 +14,36 @@ def repeat_kv_BLH(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, slen, num_key_value_heads * n_rep, head_dim)
 
 
+def _ensure_quest_timing_state(attn_module) -> None:
+    if not hasattr(attn_module, "_quest_token_select_events"):
+        attn_module._quest_token_select_events = []
+    if not hasattr(attn_module, "_quest_attn_compute_events"):
+        attn_module._quest_attn_compute_events = []
+
+
+def _quest_timing_start(attn_module):
+    if not torch.cuda.is_available():
+        return None
+    if not hasattr(attn_module, "q_proj") or (not attn_module.q_proj.weight.is_cuda):
+        return None
+    _ensure_quest_timing_state(attn_module)
+    start_evt = torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    return start_evt
+
+
+def _quest_timing_stop(attn_module, stage: str, start_evt):
+    if start_evt is None:
+        return
+    end_evt = torch.cuda.Event(enable_timing=True)
+    end_evt.record()
+    _ensure_quest_timing_state(attn_module)
+    if stage == "select":
+        attn_module._quest_token_select_events.append((start_evt, end_evt))
+    elif stage == "attn":
+        attn_module._quest_attn_compute_events.append((start_evt, end_evt))
+
+
 def quest_sel(q, min_k_for_sel, max_k_for_sel, GQA_policy, num_heads, num_kv_heads):
     if GQA_policy in ["maxQ", "avgQ"]:
         # [bsz, 1, num_kv_heads, head_dim]
@@ -157,10 +187,14 @@ def quest_arkv_attn(self,
 
     do_compress = (kv_seq_len > sink_size + recent_size + max(token_budget, ll_token_budget))
     if token_budget < 0 or not do_compress:
-        return self._flash_attention_forward(
+        attn_t0 = _quest_timing_start(self)
+        out = self._flash_attention_forward(
             q, k, v, padding_mask, q.shape[1], dropout=0.0
         )
+        _quest_timing_stop(self, "attn", attn_t0)
+        return out
 
+    sel_t0 = _quest_timing_start(self)
     last_page_size = (kv_seq_len - sink_size) % page_size
     # to achieve an averaged fix recent size
     num_recent_page = recent_size // page_size - (last_page_size > page_size//2)
@@ -241,9 +275,13 @@ def quest_arkv_attn(self,
         padding_mask[:, -recent_size:],
     ], dim=1) if padding_mask is not None else None
 
-    return self._flash_attention_forward(
+    _quest_timing_stop(self, "select", sel_t0)
+    attn_t0 = _quest_timing_start(self)
+    out = self._flash_attention_forward(
         q, used_k, used_v, used_pmask, q.shape[1], dropout=0.0
     )
+    _quest_timing_stop(self, "attn", attn_t0)
+    return out
 
 
 def raas_attn(self,

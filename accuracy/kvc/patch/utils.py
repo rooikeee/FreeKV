@@ -3,8 +3,12 @@ try:
     from flash_attn import flash_attn_func
     use_npu = False
 except ImportError:
-    import torch_npu
-    use_npu = True
+    flash_attn_func = None
+    try:
+        import torch_npu  # type: ignore  # noqa: F401
+        use_npu = True
+    except ImportError:
+        use_npu = False
 
 
 @torch.no_grad()
@@ -88,7 +92,7 @@ def flash_attn_maybe_npu(
     softmax_scale=None,
     causal=True,
 ):
-    if not use_npu:
+    if flash_attn_func is not None:
         attn_output = flash_attn_func(
             query_states,
             key_states,

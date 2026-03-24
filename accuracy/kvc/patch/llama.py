@@ -16,15 +16,19 @@ from .utils import (
 from .tuple_kv_cache import enable_tuple_kv_cache_for_llama
 
 try:
-    use_npu = False
     from flash_attn import flash_attn_func
+    use_npu = False
 except ImportError:
-    use_npu = True
-    import torch_npu
+    flash_attn_func = None
+    try:
+        import torch_npu  # type: ignore  # noqa: F401
+        use_npu = True
+    except ImportError:
+        use_npu = False
 try:
     from .flashinfer_utils import apply_rope_inplace
 except ImportError:
-    assert use_npu
+    apply_rope_inplace = None
 
 from .dynamic_attention import (
     quest_arkv_attn, raas_attn
@@ -75,7 +79,7 @@ def llama_dyn_attention_forward(
     if is_raas:
         self.kv_seq_len = kv_seq_len
 
-    if os.getenv("INPLACE_ROPE_OFF") is not None:
+    if os.getenv("INPLACE_ROPE_OFF") is not None or apply_rope_inplace is None:
         # temp fix for multi-GPU ...
         cos, sin = position_embeddings
         cos = cos.to(query_states.device)
