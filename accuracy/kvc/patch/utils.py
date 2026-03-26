@@ -104,15 +104,32 @@ def flash_attn_maybe_npu(
             causal=True,
         )
     else:
+        q = query_states.transpose(1, 2)
+        k = key_states.transpose(1, 2)
+        v = value_states.transpose(1, 2)
+
+        # SDPA requires matching head counts; for GQA/MQA we expand KV heads.
+        qh = q.shape[1]
+        kh = k.shape[1]
+        if qh != kh:
+            if qh % kh != 0:
+                raise RuntimeError(
+                    f"SDPA head mismatch: q_heads={qh}, kv_heads={kh} (not divisible)."
+                )
+            n_rep = qh // kh
+            k = torch.repeat_interleave(k, repeats=n_rep, dim=1)
+            v = torch.repeat_interleave(v, repeats=n_rep, dim=1)
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states.transpose(1,2),
-            key_states.transpose(1,2),
-            value_states.transpose(1,2),
+            q,
+            k,
+            v,
             attn_mask=None,
             dropout_p=dropout_p, 
             scale=softmax_scale,
             is_causal=causal
         )
+        attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output
 
 # def per_token_int8(x: torch.Tensor):
