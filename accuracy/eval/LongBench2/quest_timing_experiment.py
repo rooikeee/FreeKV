@@ -124,6 +124,8 @@ def main():
     parse_common_args(parser)
     parser.add_argument("--lengths", type=str, default="8192,12288,16384,20480,24576,28672,32768")
     parser.add_argument("--measure_decode_tokens", type=int, default=1)
+    parser.add_argument("--warmup_per_length", type=int, default=1)
+    parser.add_argument("--measure_repeats", type=int, default=3)
     parser.add_argument("--estimate_total_tokens", type=int, default=128)
     parser.add_argument("--save_path", type=str, default="eval/LongBench2/results/quest_timing_stats.json")
     args = parser.parse_args()
@@ -155,51 +157,71 @@ def main():
         "context": item["context"],
     }
 
-    # Warmup one short run to reduce first-kernel compilation noise.
-    warm_context, _ = truncate_context_to_target_len(
-        item, target_lengths[0], model_name, tokenizer
-    )
-    warm_prompt = build_prompt(item, warm_context)
-    _ = run_one_case(
-        warm_prompt,
-        model_name,
-        model,
-        tokenizer,
-        step_updater,
-        decode_tokens=max(1, args.measure_decode_tokens),
-    )
-
     rows = []
     for target_len in target_lengths:
         context, actual_input_len = truncate_context_to_target_len(
             item, target_len, model_name, tokenizer
         )
         prompt = build_prompt(item, context)
-        stats, decode_steps = run_one_case(
-            prompt,
-            model_name,
-            model,
-            tokenizer,
-            step_updater,
-            decode_tokens=max(1, args.measure_decode_tokens),
+
+        for _ in range(max(0, args.warmup_per_length)):
+            _ = run_one_case(
+                prompt,
+                model_name,
+                model,
+                tokenizer,
+                step_updater,
+                decode_tokens=max(1, args.measure_decode_tokens),
+            )
+
+        per_token_select = []
+        per_token_score = []
+        per_token_topk = []
+        per_token_pack = []
+        per_token_attn = []
+        measured_decode_steps = []
+
+        for _ in range(max(1, args.measure_repeats)):
+            stats, decode_steps = run_one_case(
+                prompt,
+                model_name,
+                model,
+                tokenizer,
+                step_updater,
+                decode_tokens=max(1, args.measure_decode_tokens),
+            )
+            measured_decode_steps.append(int(decode_steps))
+            if decode_steps <= 0:
+                per_token_select.append(0.0)
+                per_token_score.append(0.0)
+                per_token_topk.append(0.0)
+                per_token_pack.append(0.0)
+                per_token_attn.append(0.0)
+                continue
+            denom = float(decode_steps)
+            per_token_select.append(float(stats.get("token_select_ms", 0.0)) / denom)
+            per_token_score.append(float(stats.get("token_select_score_ms", 0.0)) / denom)
+            per_token_topk.append(float(stats.get("token_select_topk_ms", 0.0)) / denom)
+            per_token_pack.append(float(stats.get("token_pack_ms", 0.0)) / denom)
+            per_token_attn.append(float(stats.get("attn_compute_ms", 0.0)) / denom)
+
+        token_select_ms_per_token = sum(per_token_select) / float(len(per_token_select))
+        token_select_score_ms_per_token = sum(per_token_score) / float(len(per_token_score))
+        token_select_topk_ms_per_token = sum(per_token_topk) / float(len(per_token_topk))
+        token_pack_ms_per_token = sum(per_token_pack) / float(len(per_token_pack))
+        attn_compute_ms_per_token = sum(per_token_attn) / float(len(per_token_attn))
+
+        # Keep an interpretable "measured total" as avg(per-token)*avg(decoded tokens).
+        avg_decode_steps = (
+            sum(measured_decode_steps) / float(len(measured_decode_steps))
+            if len(measured_decode_steps) > 0
+            else 0.0
         )
-        token_select_ms_total = float(stats.get("token_select_ms", 0.0))
-        token_select_score_ms_total = float(stats.get("token_select_score_ms", 0.0))
-        token_select_topk_ms_total = float(stats.get("token_select_topk_ms", 0.0))
-        token_pack_ms_total = float(stats.get("token_pack_ms", 0.0))
-        attn_compute_ms_total = float(stats.get("attn_compute_ms", 0.0))
-        if decode_steps <= 0:
-            token_select_ms_per_token = 0.0
-            token_select_score_ms_per_token = 0.0
-            token_select_topk_ms_per_token = 0.0
-            token_pack_ms_per_token = 0.0
-            attn_compute_ms_per_token = 0.0
-        else:
-            token_select_ms_per_token = token_select_ms_total / float(decode_steps)
-            token_select_score_ms_per_token = token_select_score_ms_total / float(decode_steps)
-            token_select_topk_ms_per_token = token_select_topk_ms_total / float(decode_steps)
-            token_pack_ms_per_token = token_pack_ms_total / float(decode_steps)
-            attn_compute_ms_per_token = attn_compute_ms_total / float(decode_steps)
+        token_select_ms_total = token_select_ms_per_token * avg_decode_steps
+        token_select_score_ms_total = token_select_score_ms_per_token * avg_decode_steps
+        token_select_topk_ms_total = token_select_topk_ms_per_token * avg_decode_steps
+        token_pack_ms_total = token_pack_ms_per_token * avg_decode_steps
+        attn_compute_ms_total = attn_compute_ms_per_token * avg_decode_steps
 
         est_select_ms = token_select_ms_per_token * float(args.estimate_total_tokens)
         est_select_score_ms = token_select_score_ms_per_token * float(args.estimate_total_tokens)
@@ -214,7 +236,9 @@ def main():
         row = {
             "target_input_len": int(target_len),
             "actual_input_len": int(actual_input_len),
-            "decode_tokens_measured": int(decode_steps),
+            "decode_tokens_measured": int(round(avg_decode_steps)),
+            "warmup_per_length": int(max(0, args.warmup_per_length)),
+            "measure_repeats": int(max(1, args.measure_repeats)),
             "token_select_ms_total_measured": token_select_ms_total,
             "token_select_score_ms_total_measured": token_select_score_ms_total,
             "token_select_topk_ms_total_measured": token_select_topk_ms_total,
