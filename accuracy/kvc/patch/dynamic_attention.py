@@ -17,6 +17,8 @@ def repeat_kv_BLH(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 def _ensure_quest_timing_state(attn_module) -> None:
     if not hasattr(attn_module, "_quest_token_select_events"):
         attn_module._quest_token_select_events = []
+    if not hasattr(attn_module, "_quest_token_pack_events"):
+        attn_module._quest_token_pack_events = []
     if not hasattr(attn_module, "_quest_attn_compute_events"):
         attn_module._quest_attn_compute_events = []
 
@@ -40,6 +42,8 @@ def _quest_timing_stop(attn_module, stage: str, start_evt):
     _ensure_quest_timing_state(attn_module)
     if stage == "select":
         attn_module._quest_token_select_events.append((start_evt, end_evt))
+    elif stage == "pack":
+        attn_module._quest_token_pack_events.append((start_evt, end_evt))
     elif stage == "attn":
         attn_module._quest_attn_compute_events.append((start_evt, end_evt))
 
@@ -194,7 +198,6 @@ def quest_arkv_attn(self,
         _quest_timing_stop(self, "attn", attn_t0)
         return out
 
-    sel_t0 = _quest_timing_start(self)
     last_page_size = (kv_seq_len - sink_size) % page_size
     # to achieve an averaged fix recent size
     num_recent_page = recent_size // page_size - (last_page_size > page_size//2)
@@ -206,6 +209,7 @@ def quest_arkv_attn(self,
     min_k_for_sel = self.min_k[:, :self.num_pages - num_recent_page, ...]
     max_k_for_sel = self.max_k[:, :self.num_pages - num_recent_page, ...]
 
+    sel_t0 = _quest_timing_start(self)
     # selection with current or past query
     if token_budget > 0:
         if not use_spec_ret_steps:
@@ -249,6 +253,9 @@ def quest_arkv_attn(self,
             sel_page_indices = ll_sel_page_indices
         else:
             sel_page_indices = torch.unique(torch.cat([sel_page_indices, ll_sel_page_indices], dim=-1), dim=-1)
+    _quest_timing_stop(self, "select", sel_t0)
+
+    pack_t0 = _quest_timing_start(self)
     # [bsz, num_kv_heads, page_budget, page_size]
     sel_token_indices = (sink_size + sel_page_indices*page_size).unsqueeze(-1).expand(-1, -1, -1, page_size)
     sel_token_indices = sel_token_indices + torch.arange(
@@ -275,7 +282,7 @@ def quest_arkv_attn(self,
         padding_mask[:, -recent_size:],
     ], dim=1) if padding_mask is not None else None
 
-    _quest_timing_stop(self, "select", sel_t0)
+    _quest_timing_stop(self, "pack", pack_t0)
     attn_t0 = _quest_timing_start(self)
     out = self._flash_attention_forward(
         q, used_k, used_v, used_pmask, q.shape[1], dropout=0.0
