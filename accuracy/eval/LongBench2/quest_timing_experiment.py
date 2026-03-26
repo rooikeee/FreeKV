@@ -127,8 +127,17 @@ def main():
     parser.add_argument("--warmup_per_length", type=int, default=1)
     parser.add_argument("--measure_repeats", type=int, default=3)
     parser.add_argument("--estimate_total_tokens", type=int, default=128)
+    parser.add_argument("--disable_flash_attn", action="store_true", default=True)
+    parser.add_argument("--enable_flash_attn", action="store_true")
     parser.add_argument("--save_path", type=str, default="eval/LongBench2/results/quest_timing_stats.json")
     args = parser.parse_args()
+
+    if args.enable_flash_attn:
+        args.disable_flash_attn = False
+    if args.disable_flash_attn:
+        os.environ["DISABLE_FLASH_ATTN"] = "1"
+    else:
+        os.environ["DISABLE_FLASH_ATTN"] = "0"
 
     if args.model is None:
         raise ValueError("Please set --model")

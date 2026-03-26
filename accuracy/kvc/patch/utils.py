@@ -1,3 +1,4 @@
+import os
 import torch
 try:
     from flash_attn import flash_attn_func
@@ -92,7 +93,8 @@ def flash_attn_maybe_npu(
     softmax_scale=None,
     causal=True,
 ):
-    if flash_attn_func is not None:
+    disable_flash_attn = os.getenv("DISABLE_FLASH_ATTN", "0") == "1"
+    if (not disable_flash_attn) and flash_attn_func is not None:
         attn_output = flash_attn_func(
             query_states,
             key_states,

@@ -186,7 +186,12 @@ def _flash_attention_forward(
             The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
     """
     # Contains at least one padding token in the sequence
-    if padding_mask is not None and flash_attn_varlen_func is not None:
+    disable_flash_attn = os.getenv("DISABLE_FLASH_ATTN", "0") == "1"
+    if (
+        (not disable_flash_attn)
+        and padding_mask is not None
+        and flash_attn_varlen_func is not None
+    ):
         batch_size = query_states.shape[0]
         (
             query_states,
