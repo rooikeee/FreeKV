@@ -184,18 +184,26 @@ def main():
             decode_tokens=max(1, args.measure_decode_tokens),
         )
         token_select_ms_total = float(stats.get("token_select_ms", 0.0))
+        token_select_score_ms_total = float(stats.get("token_select_score_ms", 0.0))
+        token_select_topk_ms_total = float(stats.get("token_select_topk_ms", 0.0))
         token_pack_ms_total = float(stats.get("token_pack_ms", 0.0))
         attn_compute_ms_total = float(stats.get("attn_compute_ms", 0.0))
         if decode_steps <= 0:
             token_select_ms_per_token = 0.0
+            token_select_score_ms_per_token = 0.0
+            token_select_topk_ms_per_token = 0.0
             token_pack_ms_per_token = 0.0
             attn_compute_ms_per_token = 0.0
         else:
             token_select_ms_per_token = token_select_ms_total / float(decode_steps)
+            token_select_score_ms_per_token = token_select_score_ms_total / float(decode_steps)
+            token_select_topk_ms_per_token = token_select_topk_ms_total / float(decode_steps)
             token_pack_ms_per_token = token_pack_ms_total / float(decode_steps)
             attn_compute_ms_per_token = attn_compute_ms_total / float(decode_steps)
 
         est_select_ms = token_select_ms_per_token * float(args.estimate_total_tokens)
+        est_select_score_ms = token_select_score_ms_per_token * float(args.estimate_total_tokens)
+        est_select_topk_ms = token_select_topk_ms_per_token * float(args.estimate_total_tokens)
         est_pack_ms = token_pack_ms_per_token * float(args.estimate_total_tokens)
         est_attn_ms = attn_compute_ms_per_token * float(args.estimate_total_tokens)
         ratio = (
@@ -208,16 +216,24 @@ def main():
             "actual_input_len": int(actual_input_len),
             "decode_tokens_measured": int(decode_steps),
             "token_select_ms_total_measured": token_select_ms_total,
+            "token_select_score_ms_total_measured": token_select_score_ms_total,
+            "token_select_topk_ms_total_measured": token_select_topk_ms_total,
             "token_pack_ms_total_measured": token_pack_ms_total,
             "attn_compute_ms_total_measured": attn_compute_ms_total,
             "token_select_ms_per_token": token_select_ms_per_token,
+            "token_select_score_ms_per_token": token_select_score_ms_per_token,
+            "token_select_topk_ms_per_token": token_select_topk_ms_per_token,
             "token_pack_ms_per_token": token_pack_ms_per_token,
             "attn_compute_ms_per_token": attn_compute_ms_per_token,
             "token_select_ms_est_total": est_select_ms,
+            "token_select_score_ms_est_total": est_select_score_ms,
+            "token_select_topk_ms_est_total": est_select_topk_ms,
             "token_pack_ms_est_total": est_pack_ms,
             "attn_compute_ms_est_total": est_attn_ms,
             "estimate_total_tokens": int(args.estimate_total_tokens),
             "select_calls": int(stats.get("token_select_calls", 0)),
+            "select_score_calls": int(stats.get("token_select_score_calls", 0)),
+            "select_topk_calls": int(stats.get("token_select_topk_calls", 0)),
             "pack_calls": int(stats.get("token_pack_calls", 0)),
             "attn_calls": int(stats.get("attn_compute_calls", 0)),
             "select_over_attn_ratio": ratio,
@@ -227,9 +243,13 @@ def main():
         print(
             f"len={row['actual_input_len']}, "
             f"select_per_token_ms={row['token_select_ms_per_token']:.3f}, "
+            f"score_per_token_ms={row['token_select_score_ms_per_token']:.3f}, "
+            f"topk_per_token_ms={row['token_select_topk_ms_per_token']:.3f}, "
             f"pack_per_token_ms={row['token_pack_ms_per_token']:.3f}, "
             f"attn_per_token_ms={row['attn_compute_ms_per_token']:.3f}, "
             f"select_x{args.estimate_total_tokens}={row['token_select_ms_est_total']:.3f}, "
+            f"score_x{args.estimate_total_tokens}={row['token_select_score_ms_est_total']:.3f}, "
+            f"topk_x{args.estimate_total_tokens}={row['token_select_topk_ms_est_total']:.3f}, "
             f"pack_x{args.estimate_total_tokens}={row['token_pack_ms_est_total']:.3f}, "
             f"attn_x{args.estimate_total_tokens}={row['attn_compute_ms_est_total']:.3f}, "
             f"ratio={ratio_text}"

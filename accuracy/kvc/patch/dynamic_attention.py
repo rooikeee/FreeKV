@@ -17,6 +17,10 @@ def repeat_kv_BLH(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 def _ensure_quest_timing_state(attn_module) -> None:
     if not hasattr(attn_module, "_quest_token_select_events"):
         attn_module._quest_token_select_events = []
+    if not hasattr(attn_module, "_quest_token_select_score_events"):
+        attn_module._quest_token_select_score_events = []
+    if not hasattr(attn_module, "_quest_token_select_topk_events"):
+        attn_module._quest_token_select_topk_events = []
     if not hasattr(attn_module, "_quest_token_pack_events"):
         attn_module._quest_token_pack_events = []
     if not hasattr(attn_module, "_quest_attn_compute_events"):
@@ -42,6 +46,10 @@ def _quest_timing_stop(attn_module, stage: str, start_evt):
     _ensure_quest_timing_state(attn_module)
     if stage == "select":
         attn_module._quest_token_select_events.append((start_evt, end_evt))
+    elif stage == "select_score":
+        attn_module._quest_token_select_score_events.append((start_evt, end_evt))
+    elif stage == "select_topk":
+        attn_module._quest_token_select_topk_events.append((start_evt, end_evt))
     elif stage == "pack":
         attn_module._quest_token_pack_events.append((start_evt, end_evt))
     elif stage == "attn":
@@ -198,11 +206,17 @@ def quest_arkv_attn(self,
         _quest_timing_stop(self, "attn", attn_t0)
         return out
 
-    last_page_size = (kv_seq_len - sink_size) % page_size
-    # to achieve an averaged fix recent size
-    num_recent_page = recent_size // page_size - (last_page_size > page_size//2)
-    # recent pages + last page
-    recent_size = num_recent_page * page_size + last_page_size
+    if recent_size <= 0:
+        num_recent_page = 0
+        recent_size = 0
+    else:
+        last_page_size = (kv_seq_len - sink_size) % page_size
+        # to achieve an averaged fixed recent size
+        num_recent_page = max(
+            0, recent_size // page_size - int(last_page_size > page_size // 2)
+        )
+        # recent pages + last page
+        recent_size = num_recent_page * page_size + last_page_size
 
     # exclude the recent pages for selection
     # [1, num_used_pages, num_kv_heads, head_dim]
@@ -237,16 +251,24 @@ def quest_arkv_attn(self,
             else:
                 probe_q = past_q
 
+        score_t0 = _quest_timing_start(self)
         max_qk = quest_sel(probe_q, min_k_for_sel, max_k_for_sel, self.GQA_policy, num_heads, num_kv_heads)
+        _quest_timing_stop(self, "select_score", score_t0)
         # [bsz, num_kv_heads, page_budget]
+        topk_t0 = _quest_timing_start(self)
         _, sel_page_indices = torch.topk(max_qk, page_budget, dim=-1)
+        _quest_timing_stop(self, "select_topk", topk_t0)
     
     # selection with last layer query
     if self.layer_idx > 0 and ll_page_budget > 0:
         llq_ptr = (self.last_layer_attn.q_ptr - 1) % self.spec_ret_steps
         llq = self.last_layer_attn.q_cache[:, llq_ptr, ...]
+        ll_score_t0 = _quest_timing_start(self)
         max_qk = quest_sel(llq, min_k_for_sel, max_k_for_sel, self.GQA_policy, num_heads, num_kv_heads)
+        _quest_timing_stop(self, "select_score", ll_score_t0)
+        ll_topk_t0 = _quest_timing_start(self)
         _, ll_sel_page_indices = torch.topk(max_qk, ll_page_budget, dim=-1)
+        _quest_timing_stop(self, "select_topk", ll_topk_t0)
         # [bsz, num_kv_heads, (up to) page_budget + ll_page_budget]
         # still maybe repeated pages...
         if token_budget == 0:
@@ -270,17 +292,27 @@ def quest_arkv_attn(self,
     sel_k = torch.gather(k, dim=1, index=sel_token_indices)
     sel_v = torch.gather(v, dim=1, index=sel_token_indices)
 
+    k_tail = k[:, -recent_size:, ...] if recent_size > 0 else k[:, :0, ...]
+    v_tail = v[:, -recent_size:, ...] if recent_size > 0 else v[:, :0, ...]
     used_k = torch.cat([
-        k[:, :sink_size, ...], sel_k, k[:, -recent_size:, ...],
+        k[:, :sink_size, ...], sel_k, k_tail,
     ], dim=1)
     used_v = torch.cat([
-        v[:, :sink_size, ...], sel_v, v[:, -recent_size:, ...],
+        v[:, :sink_size, ...], sel_v, v_tail,
     ], dim=1)
-    used_pmask = torch.cat([
-        padding_mask[:, :sink_size], 
-        self.budget_ones,
-        padding_mask[:, -recent_size:],
-    ], dim=1) if padding_mask is not None else None
+    if padding_mask is not None:
+        mask_tail = (
+            padding_mask[:, -recent_size:]
+            if recent_size > 0
+            else padding_mask[:, :0]
+        )
+        used_pmask = torch.cat([
+            padding_mask[:, :sink_size],
+            self.budget_ones,
+            mask_tail,
+        ], dim=1)
+    else:
+        used_pmask = None
 
     _quest_timing_stop(self, "pack", pack_t0)
     attn_t0 = _quest_timing_start(self)

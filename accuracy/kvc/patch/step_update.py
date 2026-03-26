@@ -32,6 +32,8 @@ class QuestUpdater(StepUpdater):
         for layer in self.model.model.layers:
             layer.self_attn.num_pages = 0
             layer.self_attn._quest_token_select_events = []
+            layer.self_attn._quest_token_select_score_events = []
+            layer.self_attn._quest_token_select_topk_events = []
             layer.self_attn._quest_token_pack_events = []
             layer.self_attn._quest_attn_compute_events = []
 
@@ -52,44 +54,68 @@ class QuestUpdater(StepUpdater):
                 synced_devices.add(dev_idx)
 
         layer_token_select_ms = []
+        layer_token_select_score_ms = []
+        layer_token_select_topk_ms = []
         layer_token_pack_ms = []
         layer_attn_compute_ms = []
         layer_token_select_calls = []
+        layer_token_select_score_calls = []
+        layer_token_select_topk_calls = []
         layer_token_pack_calls = []
         layer_attn_compute_calls = []
 
         for layer in self.model.model.layers:
             attn = layer.self_attn
             select_events = getattr(attn, "_quest_token_select_events", [])
+            score_events = getattr(attn, "_quest_token_select_score_events", [])
+            topk_events = getattr(attn, "_quest_token_select_topk_events", [])
             pack_events = getattr(attn, "_quest_token_pack_events", [])
             attn_events = getattr(attn, "_quest_attn_compute_events", [])
             sel_ms = 0.0
+            score_ms = 0.0
+            topk_ms = 0.0
             pack_ms = 0.0
             attn_ms = 0.0
             for start_evt, end_evt in select_events:
                 sel_ms += float(start_evt.elapsed_time(end_evt))
+            for start_evt, end_evt in score_events:
+                score_ms += float(start_evt.elapsed_time(end_evt))
+            for start_evt, end_evt in topk_events:
+                topk_ms += float(start_evt.elapsed_time(end_evt))
             for start_evt, end_evt in pack_events:
                 pack_ms += float(start_evt.elapsed_time(end_evt))
             for start_evt, end_evt in attn_events:
                 attn_ms += float(start_evt.elapsed_time(end_evt))
             layer_token_select_ms.append(sel_ms)
+            layer_token_select_score_ms.append(score_ms)
+            layer_token_select_topk_ms.append(topk_ms)
             layer_token_pack_ms.append(pack_ms)
             layer_attn_compute_ms.append(attn_ms)
             layer_token_select_calls.append(len(select_events))
+            layer_token_select_score_calls.append(len(score_events))
+            layer_token_select_topk_calls.append(len(topk_events))
             layer_token_pack_calls.append(len(pack_events))
             layer_attn_compute_calls.append(len(attn_events))
 
         return {
             "token_select_ms": float(sum(layer_token_select_ms)),
+            "token_select_score_ms": float(sum(layer_token_select_score_ms)),
+            "token_select_topk_ms": float(sum(layer_token_select_topk_ms)),
             "token_pack_ms": float(sum(layer_token_pack_ms)),
             "attn_compute_ms": float(sum(layer_attn_compute_ms)),
             "token_select_calls": int(sum(layer_token_select_calls)),
+            "token_select_score_calls": int(sum(layer_token_select_score_calls)),
+            "token_select_topk_calls": int(sum(layer_token_select_topk_calls)),
             "token_pack_calls": int(sum(layer_token_pack_calls)),
             "attn_compute_calls": int(sum(layer_attn_compute_calls)),
             "layer_token_select_ms": layer_token_select_ms,
+            "layer_token_select_score_ms": layer_token_select_score_ms,
+            "layer_token_select_topk_ms": layer_token_select_topk_ms,
             "layer_token_pack_ms": layer_token_pack_ms,
             "layer_attn_compute_ms": layer_attn_compute_ms,
             "layer_token_select_calls": layer_token_select_calls,
+            "layer_token_select_score_calls": layer_token_select_score_calls,
+            "layer_token_select_topk_calls": layer_token_select_topk_calls,
             "layer_token_pack_calls": layer_token_pack_calls,
             "layer_attn_compute_calls": layer_attn_compute_calls,
         }
