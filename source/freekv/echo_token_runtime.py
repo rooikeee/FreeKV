@@ -572,8 +572,9 @@ def _triton_flash_decode_attn_with_page_max(
         return None, None
     if max_tokens < seq_len:
         return None, None
-    if page_size <= 0 or (max_tokens % page_size) != 0:
+    if page_size <= 0:
         return None, None
+    max_tokens_eff = int(((seq_len + page_size - 1) // page_size) * page_size)
     mid_tokens = int(mid_pages * page_size)
     mid_end = int(mid_start + mid_tokens)
     if mid_pages <= 0 or mid_start < 0 or mid_end > seq_len:
@@ -625,7 +626,7 @@ def _triton_flash_decode_attn_with_page_max(
         1.0 / math.sqrt(float(head_dim)),
         BLOCK_D=block_d,
         PAGE_SIZE=page_size,
-        MAX_TOKENS=max_tokens,
+        MAX_TOKENS=max_tokens_eff,
         MID_START=mid_start,
         MID_END=mid_end,
         num_warps=num_warps,
@@ -665,8 +666,9 @@ def _triton_flash_decode_qk_select(
     seq_len = int(k.shape[2])
     if seq_len <= 0 or max_tokens < seq_len:
         return None, None
-    if page_size <= 0 or (max_tokens % page_size) != 0:
+    if page_size <= 0:
         return None, None
+    max_tokens_eff = int(((seq_len + page_size - 1) // page_size) * page_size)
     mid_tokens = int(mid_pages * page_size)
     mid_end = int(mid_start + mid_tokens)
     if mid_pages <= 0 or mid_start < 0 or mid_end > seq_len:
@@ -677,7 +679,7 @@ def _triton_flash_decode_qk_select(
     q_c = q if q.is_contiguous() else q.contiguous()
     k_c = k if k.is_contiguous() else k.contiguous()
     scores = torch.empty(
-        (bsz, n_q_heads, max_tokens),
+        (bsz, n_q_heads, max_tokens_eff),
         dtype=torch.float32,
         device=q.device,
     )
@@ -715,7 +717,7 @@ def _triton_flash_decode_qk_select(
         1.0 / math.sqrt(float(head_dim)),
         BLOCK_D=block_d,
         PAGE_SIZE=page_size,
-        MAX_TOKENS=max_tokens,
+        MAX_TOKENS=max_tokens_eff,
         MID_START=mid_start,
         MID_END=mid_end,
         num_warps=num_warps,
@@ -758,12 +760,15 @@ def _triton_flash_decode_pv_from_scores(
         device=scores.device,
     )
 
-    page_size = 32
-    if max_tokens % 128 == 0:
-        page_size = 128
-    elif max_tokens % 64 == 0:
-        page_size = 64
-    if max_tokens % page_size != 0:
+    page_size = None
+    max_tokens_eff = None
+    for cand in (128, 64, 32):
+        cand_eff = int(((seq_len + cand - 1) // cand) * cand)
+        if cand_eff <= max_tokens:
+            page_size = cand
+            max_tokens_eff = cand_eff
+            break
+    if page_size is None or max_tokens_eff is None:
         return None
 
     block_d = _next_pow2_cap(head_dim, 256)
@@ -789,7 +794,7 @@ def _triton_flash_decode_pv_from_scores(
         head_dim,
         BLOCK_D=block_d,
         PAGE_SIZE=page_size,
-        MAX_TOKENS=max_tokens,
+        MAX_TOKENS=max_tokens_eff,
         num_warps=num_warps,
     )
     return out.to(dtype=v.dtype)
@@ -838,9 +843,10 @@ def _triton_flash_decode_attn_plain(
     out = torch.empty_like(q_c)
 
     block_d = _next_pow2_cap(head_dim, 256)
-    block_n = 128 if max_tokens >= 128 else 64
-    if block_n > max_tokens:
-        block_n = _next_pow2_cap(max_tokens, 128)
+    block_n = 128 if seq_len >= 128 else 64
+    if block_n > seq_len:
+        block_n = _next_pow2_cap(seq_len, 128)
+    max_tokens_eff = int(((seq_len + block_n - 1) // block_n) * block_n)
     num_warps = 4 if block_d <= 128 else 8
     grid = (bsz * n_q_heads,)
 
@@ -870,7 +876,7 @@ def _triton_flash_decode_attn_plain(
         1.0 / math.sqrt(float(head_dim)),
         BLOCK_D=block_d,
         BLOCK_N=block_n,
-        MAX_TOKENS=max_tokens,
+        MAX_TOKENS=max_tokens_eff,
         num_warps=num_warps,
     )
     return out
@@ -1854,6 +1860,25 @@ class EchoTokenPrefetchRuntime:
         starts = torch.clamp(starts, min=lower, max=max_start)
         return starts.to(dtype=torch.int32).contiguous()
 
+    def _reduce_qh_best_to_local_best(self, qh_best: torch.Tensor) -> torch.Tensor:
+        # qh_best: [eff, n_q_heads, page_count], int32
+        if qh_best.dim() != 3:
+            raise RuntimeError(
+                f"qh_best must be 3D [eff, n_q_heads, pages], got {tuple(qh_best.shape)}"
+            )
+        eff, n_q_heads, page_count = qh_best.shape
+        expect_heads = int(self.n_kv_heads * self.n_q_per_kv)
+        if n_q_heads != expect_heads:
+            raise RuntimeError(
+                f"qh_best n_q_heads mismatch: got {n_q_heads}, expect {expect_heads}"
+            )
+        sum_best = (
+            qh_best.view(eff, self.n_kv_heads, self.n_q_per_kv, page_count)
+            .to(dtype=torch.int32)
+            .sum(dim=(1, 2), dtype=torch.int32)
+        )
+        return ((sum_best + (expect_heads // 2)) // expect_heads).to(torch.int32)
+
     def build_starts(self, seq_len: int) -> Optional[torch.Tensor]:
         if self.mid_pages <= 0:
             return None
@@ -2560,9 +2585,7 @@ class EchoTokenPrefetchRuntime:
             return None
 
         if local_best is None:
-            local_best = qh_best.view(
-                qh_best.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
-            ).float().mean(dim=(1, 2)).round().to(torch.int32)
+            local_best = self._reduce_qh_best_to_local_best(qh_best)
         starts_i32 = (
             self.active_starts
             if self.active_starts.dtype == torch.int32
@@ -2734,9 +2757,7 @@ class EchoTokenPrefetchRuntime:
                 scores[:, :, tok_begin:tok_end].copy_(chunk_scores, non_blocking=True)
 
             if local_best_chunk is None:
-                local_best_chunk = qh_best.view(
-                    eff, self.n_kv_heads, self.n_q_per_kv, p_count
-                ).float().mean(dim=(1, 2)).round().to(torch.int32)
+                local_best_chunk = self._reduce_qh_best_to_local_best(qh_best)
             if use_gpu_starts:
                 local_best_full[:, p0 : p0 + p_count].copy_(
                     local_best_chunk, non_blocking=True
@@ -3028,9 +3049,7 @@ class EchoTokenPrefetchRuntime:
                         self.page_size,
                         self.mid_pages,
                     )
-                    local_best_all = qh_best_all.view(
-                        eff, self.n_kv_heads, self.n_q_per_kv, self.mid_pages
-                    ).float().mean(dim=(1, 2)).round().to(torch.int32)
+                    local_best_all = self._reduce_qh_best_to_local_best(qh_best_all)
                 if local_best_all is None:
                     return False
                 if use_gpu_starts:
@@ -3134,9 +3153,7 @@ class EchoTokenPrefetchRuntime:
                             return False
 
                     if local_best_chunk is None:
-                        local_best_chunk = qh_best.view(
-                            eff, self.n_kv_heads, self.n_q_per_kv, p_count
-                        ).float().mean(dim=(1, 2)).round().to(torch.int32)
+                        local_best_chunk = self._reduce_qh_best_to_local_best(qh_best)
                     if use_gpu_starts:
                         starts_chunk_gpu = starts_full_gpu[:, p0 : p0 + p_count]
                         starts_chunk_gpu.add_(local_best_chunk.to(dtype=torch.int32))
@@ -3338,9 +3355,7 @@ class EchoTokenPrefetchRuntime:
             return self.attend(q, local_k, local_v), False
 
         # q-head aggregation to shared [eff, mid_pages] anchors.
-        local_best = qh_best.view(
-            fused_out.shape[0], self.n_kv_heads, self.n_q_per_kv, self.mid_pages
-        ).float().mean(dim=(1, 2)).round().to(torch.int32)
+        local_best = self._reduce_qh_best_to_local_best(qh_best)
         starts_i32 = (
             self.active_starts
             if self.active_starts.dtype == torch.int32
